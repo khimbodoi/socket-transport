@@ -13,14 +13,20 @@ ALLOWED_TYPES = {
     "bye",
     "error",
     "join_room",
+    "leave_room",
+    "delete_room",
     "room_list",
+    "join_request",
+    "approve_join",
+    "kick_member",
+    "get_members",
+    "member_list",
     "file_start",
     "file_end",
     "file_saved",
     "recall",
 }
 
-# Frame nhị phân truyền dữ liệu file/ảnh trực tiếp bằng bytes (bắt đầu bằng 0x89, không bao giờ trùng '{' của JSON)
 BINARY_MAGIC = b"\x89BIN"
 FILE_CHUNK_SIZE = 48 * 1024  # 48 KiB mỗi mảnh (< giới hạn 64 KiB của transport.py)
 MAX_FILE_SIZE = 5 * 1024 * 1024  # Tối đa 5 MB mỗi file/ảnh
@@ -36,6 +42,13 @@ def normalize_room_name(raw_name: str) -> str:
     cleaned = re.sub(r"\s+", "-", cleaned)
     cleaned = re.sub(r"[^\w\-]", "", cleaned, flags=re.UNICODE)
     return cleaned[:32]
+
+
+def _validate_str_list(val: object, field_name: str, allow_empty_items: bool = False) -> None:
+    if not isinstance(val, list) or not all(
+        isinstance(item, str) and (allow_empty_items or item.strip()) for item in val
+    ):
+        raise ProtocolError(f"{field_name} phải là danh sách chuỗi hợp lệ")
 
 
 def _validate_message(message) -> None:
@@ -61,7 +74,14 @@ def _validate_message(message) -> None:
         "bye": set(),
         "error": {"code", "message"},
         "join_room": {"room"},
+        "leave_room": {"room"},
+        "delete_room": {"room"},
         "room_list": {"rooms", "current_room"},
+        "join_request": {"room", "username"},
+        "approve_join": {"room", "target", "approve"},
+        "kick_member": {"room", "target"},
+        "get_members": {"room"},
+        "member_list": {"room", "members"},
         "file_start": {"file_id", "filename", "size", "total_chunks"},
         "file_end": {"file_id"},
         "file_saved": {"file_id", "msg_id"},
@@ -72,8 +92,15 @@ def _validate_message(message) -> None:
         "chat": {"sender", "room", "timestamp", "system", "history", "msg_id", "recalled"},
         "bye": set(),
         "error": set(),
-        "join_room": set(),
-        "room_list": set(),
+        "join_room": {"is_private"},
+        "leave_room": set(),
+        "delete_room": set(),
+        "room_list": {"owners", "private_rooms", "joined_rooms"},
+        "join_request": {"timestamp"},
+        "approve_join": set(),
+        "kick_member": set(),
+        "get_members": set(),
+        "member_list": {"owner", "is_private", "online_members", "pending_requests"},
         "file_start": {"sender", "room", "timestamp", "history", "msg_id"},
         "file_end": set(),
         "file_saved": {"room", "timestamp"},
@@ -99,12 +126,14 @@ def _validate_message(message) -> None:
         "filename",
         "sender",
         "timestamp",
+        "target",
+        "owner",
     }
     for field in str_fields & message.keys():
         if not isinstance(message[field], str):
             raise ProtocolError(f"{field} phải là chuỗi")
 
-    for bool_field in {"system", "history", "recalled"} & message.keys():
+    for bool_field in {"system", "history", "recalled", "is_private", "approve"} & message.keys():
         if not isinstance(message[bool_field], bool):
             raise ProtocolError(f"{bool_field} phải là kiểu bool")
 
@@ -113,21 +142,46 @@ def _validate_message(message) -> None:
         if isinstance(mid, bool) or not isinstance(mid, int) or mid <= 0:
             raise ProtocolError("msg_id phải là số nguyên dương")
 
-    if msg_type == "hello" and not message["username"].strip():
+    if msg_type in {"hello", "join_request"} and not message["username"].strip():
         raise ProtocolError("username không được để trống")
     if msg_type == "error" and not message["code"].strip():
         raise ProtocolError("code không được để trống")
-    if msg_type == "join_room" and not normalize_room_name(message["room"]):
+    if msg_type in {
+        "join_room",
+        "leave_room",
+        "delete_room",
+        "join_request",
+        "approve_join",
+        "kick_member",
+        "get_members",
+        "member_list",
+    } and not normalize_room_name(message["room"]):
         raise ProtocolError("room không hợp lệ hoặc để trống")
 
+    if msg_type in {"approve_join", "kick_member"} and not message["target"].strip():
+        raise ProtocolError("target không được để trống")
+
     if msg_type == "room_list":
-        rooms = message["rooms"]
-        if not isinstance(rooms, list) or not all(
-            isinstance(r, str) and r.strip() for r in rooms
-        ):
-            raise ProtocolError("rooms phải là danh sách chuỗi tên phòng")
+        _validate_str_list(message["rooms"], "rooms")
         if not message["current_room"].strip():
             raise ProtocolError("current_room không được để trống")
+        if "owners" in message:
+            owners = message["owners"]
+            if not isinstance(owners, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in owners.items()
+            ):
+                raise ProtocolError("owners phải là dict ánh xạ tên phòng -> tên admin")
+        if "private_rooms" in message:
+            _validate_str_list(message["private_rooms"], "private_rooms")
+        if "joined_rooms" in message:
+            _validate_str_list(message["joined_rooms"], "joined_rooms")
+
+    if msg_type == "member_list":
+        _validate_str_list(message["members"], "members")
+        if "online_members" in message:
+            _validate_str_list(message["online_members"], "online_members")
+        if "pending_requests" in message:
+            _validate_str_list(message["pending_requests"], "pending_requests")
 
     if msg_type == "file_start":
         if not message["file_id"].strip() or not message["filename"].strip():
@@ -191,14 +245,12 @@ def make_message(msg_type: str, **fields) -> dict:
 
 
 def is_binary_frame(payload: bytes) -> bool:
-    """Kiểm tra xem frame TCP nhận được là gói nhị phân (file chunk) hay JSON."""
     return isinstance(payload, (bytes, bytearray)) and bytes(payload).startswith(
         BINARY_MAGIC
     )
 
 
 def encode_binary_chunk(file_id: str, chunk_index: int, data: bytes) -> bytes:
-    """Đóng gói một mảnh dữ liệu nhị phân (bytes) để truyền thẳng qua send_msg()."""
     if not isinstance(data, (bytes, bytearray)):
         raise ProtocolError("Dữ liệu chunk phải có kiểu bytes")
     fid_bytes = file_id.strip().encode("utf-8")
@@ -220,7 +272,6 @@ def encode_binary_chunk(file_id: str, chunk_index: int, data: bytes) -> bytes:
 
 
 def decode_binary_chunk(payload: bytes) -> Tuple[str, int, bytes]:
-    """Giải mã frame nhị phân thành bộ (file_id, chunk_index, raw_chunk_bytes)."""
     if not isinstance(payload, (bytes, bytearray)):
         raise ProtocolError("Frame nhị phân phải có kiểu bytes")
     raw = bytes(payload)

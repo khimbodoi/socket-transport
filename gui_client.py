@@ -1,14 +1,17 @@
 """Giao diện người dùng (GUI Client) cho Đồ án Socket TCP - Phần của Minh Khang.
 
-Đầy đủ 4 tính năng nâng cao trên nền `transport.py` + `protocol.py`:
-1. Chia phòng chat (Channels): Tạo phòng mới & chuyển phòng trực tiếp ở thanh bên trái.
+Đầy đủ các tính năng nâng cao:
+1. Phòng Public / Private & Phân quyền Admin:
+   - Tích chọn '🔒 Phòng riêng tư (Private)' khi tạo phòng mới -> người khác bấm vào phải chờ Admin duyệt.
+   - Admin nhận thông báo xin vào phòng trực tiếp kèm nút '✅ Duyệt' / '❌ Từ chối'.
+   - Nút '👥 Thành viên' (hoặc gõ '///' vào ô chat) để xem danh sách thành viên; Admin có nút '🚫 Kick' từng người.
+   - Thành viên thường có nút '🚪 Rời phòng'; Admin có nút '🗑️ Xóa phòng' giải tán cho tất cả.
 2. Gửi File / Hình ảnh nhị phân (bytes): Truyền mảnh nhị phân qua socket, xem trước ảnh trực tiếp & nút tải về.
-3. Lịch sử tin nhắn SQLite: Tự động nạp lại tin nhắn, hình ảnh/file cũ & trạng thái thu hồi khi đăng nhập lại.
-4. Thu hồi tin nhắn & File/Ảnh (Recall/Unsend): Nút '↩ Thu hồi' xóa nội dung/ảnh tại chỗ trên mọi màn hình theo thời gian thực.
+3. Lịch sử SQLite & Thu hồi tin nhắn ('↩ Thu hồi'): Đồng bộ xóa nội dung/ảnh tại chỗ theo thời gian thực.
 
 Chạy chương trình:
     py gui_client.py --name "Minh Khang"
-    py gui_client.py --name "Thái Hoà" --room hoc-tap
+    py gui_client.py --name "Thái Hoà"
 """
 
 import argparse
@@ -21,7 +24,7 @@ import os
 import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from network_client import (
     EVENT_CONNECTED,
@@ -41,7 +44,7 @@ from protocol import (
     make_message,
     normalize_room_name,
 )
-from storage import DEFAULT_ROOMS
+from storage import DEFAULT_ROOMS, LOBBY_ROOM
 from transport import MAX_SIZE
 
 try:
@@ -94,7 +97,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--name", "--n", default="Minh Khang", help="Tên người dùng hiển thị"
     )
     parser.add_argument(
-        "--room", "--r", default="chung", help="Phòng chat ban đầu khi kết nối"
+        "--room",
+        "--r",
+        default=None,
+        help="Phòng muốn vào thẳng (bỏ trống để tự khôi phục phòng gần nhất từ SQLite)",
     )
     return parser.parse_args(argv)
 
@@ -121,7 +127,7 @@ class PendingFileDownload:
 
 
 class ChatClientGUI:
-    """Cửa sổ giao diện Chat đa phòng, gửi file nhị phân, lịch sử SQLite & thu hồi tin nhắn."""
+    """Cửa sổ giao diện Chat đa phòng (Public/Private, Admin Kick/Duyệt), File nhị phân, SQLite & Thu hồi."""
 
     def __init__(
         self,
@@ -129,7 +135,7 @@ class ChatClientGUI:
         initial_host: str = "127.0.0.1",
         initial_port: int = 65432,
         initial_name: str = "Minh Khang",
-        initial_room: str = "chung",
+        initial_room: Optional[str] = None,
     ) -> None:
         self.root = root
         self.root.title("TCP Socket Chat — Đồ án Mạng máy tính")
@@ -137,10 +143,17 @@ class ChatClientGUI:
 
         self.client = SocketClient()
         self.active_username = initial_name
-        self.current_room = normalize_room_name(initial_room) or "chung"
+
+        norm_init = normalize_room_name(initial_room) if initial_room else ""
+        self._explicit_connect_room: Optional[str] = norm_init or None
+        self.current_room = norm_init or LOBBY_ROOM
+
         self.rooms: List[str] = list(DEFAULT_ROOMS)
         if self.current_room not in self.rooms:
             self.rooms.append(self.current_room)
+        self.room_owners: Dict[str, str] = {}
+        self.private_rooms: Set[str] = set()
+        self.joined_rooms: Set[str] = set(DEFAULT_ROOMS)
 
         self._updating_room_listbox = False
         self._incoming_files: Dict[str, PendingFileDownload] = {}
@@ -148,14 +161,17 @@ class ChatClientGUI:
         self._rendered_meta: Dict[int, Dict[str, object]] = {}
         self._widget_refs: List[object] = []
 
+        self._members_dialog: Optional[tk.Toplevel] = None
+        self._members_body_frame: Optional[tk.Frame] = None
+        self._open_dialog_on_next_members = False
+
         self.host_var = tk.StringVar(value=initial_host)
         self.port_var = tk.StringVar(value=str(initial_port))
         self.name_var = tk.StringVar(value=initial_name)
         self.new_room_var = tk.StringVar()
+        self.new_room_private_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="● Chưa kết nối")
-        self.room_banner_var = tk.StringVar(
-            value=f"#{self.current_room} — Lịch sử SQLite & Trò chuyện trực tuyến"
-        )
+        self.room_banner_var = tk.StringVar()
         self.byte_counter_var = tk.StringVar()
 
         self._setup_styles()
@@ -167,7 +183,7 @@ class ChatClientGUI:
         self._update_byte_counter()
 
         self.append_system_log(
-            "Sẵn sàng. Chạy 'py chat_server.py', nhập tên rồi bấm 'Kết nối' để trò chuyện."
+            "Sẵn sàng. Bấm 'Kết nối' để đồng bộ phòng. Gõ '///' hoặc bấm '👥 Thành viên' để kiểm tra thành viên nhóm."
         )
         self.root.after(POLL_INTERVAL_MS, self._poll_network_events)
 
@@ -180,9 +196,13 @@ class ChatClientGUI:
 
         style.configure("Field.TLabel", background="#FFFFFF", foreground="#334155", font=("Segoe UI", 9))
         style.configure("SidebarTitle.TLabel", background="#FFFFFF", foreground="#0F172A", font=("Segoe UI", 9, "bold"))
+        style.configure("SidebarCheck.TCheckbutton", background="#FFFFFF", foreground="#334155", font=("Segoe UI", 9))
         style.configure("Hint.TLabel", background="#F1F5F9", foreground="#64748B", font=("Segoe UI", 9))
         style.configure("Action.TButton", font=("Segoe UI", 9, "bold"), padding=(12, 4))
         style.configure("Secondary.TButton", font=("Segoe UI", 9), padding=(8, 3))
+        style.configure("Danger.TButton", foreground="#B91C1C", font=("Segoe UI", 9, "bold"), padding=(8, 2))
+        style.configure("Approve.TButton", foreground="#15803D", font=("Segoe UI", 8, "bold"), padding=(6, 1))
+        style.configure("Reject.TButton", foreground="#B91C1C", font=("Segoe UI", 8, "bold"), padding=(6, 1))
         style.configure("Inline.TButton", font=("Segoe UI", 8), padding=(5, 1))
 
     def _build_layout(self) -> None:
@@ -274,7 +294,7 @@ class ChatClientGUI:
 
         self.room_listbox = tk.Listbox(
             sidebar_card,
-            width=18,
+            width=22,
             exportselection=False,
             activestyle="none",
             bg="#F8FAFC",
@@ -288,13 +308,21 @@ class ChatClientGUI:
         )
         self.room_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
 
-        ttk.Label(sidebar_card, text="Tạo / vào phòng:", style="Field.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(0, 4)
+        ttk.Label(sidebar_card, text="Tạo / tham gia phòng:", style="Field.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(0, 3)
         )
         self.new_room_entry = ttk.Entry(
-            sidebar_card, textvariable=self.new_room_var, width=18, font=("Segoe UI", 9)
+            sidebar_card, textvariable=self.new_room_var, width=22, font=("Segoe UI", 9)
         )
-        self.new_room_entry.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        self.new_room_entry.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+
+        self.private_check = ttk.Checkbutton(
+            sidebar_card,
+            text="🔒 Phòng riêng tư (Private)",
+            variable=self.new_room_private_var,
+            style="SidebarCheck.TCheckbutton",
+        )
+        self.private_check.grid(row=4, column=0, sticky="w", pady=(0, 6))
 
         self.join_room_btn = ttk.Button(
             sidebar_card,
@@ -302,7 +330,7 @@ class ChatClientGUI:
             style="Secondary.TButton",
             command=self.create_or_join_room,
         )
-        self.join_room_btn.grid(row=4, column=0, sticky="ew")
+        self.join_room_btn.grid(row=5, column=0, sticky="ew")
 
         chat_card = tk.Frame(
             body_frame,
@@ -314,16 +342,36 @@ class ChatClientGUI:
         chat_card.columnconfigure(0, weight=1)
         chat_card.rowconfigure(1, weight=1)
 
-        banner = tk.Frame(chat_card, bg="#EFF6FF", padx=12, pady=6)
-        banner.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(
-            banner,
+        # Thanh tiêu đề phòng: tên phòng + nút Thành viên + nút Rời/Xóa phòng
+        self.banner = tk.Frame(chat_card, bg="#EFF6FF", padx=12, pady=6)
+        self.banner.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.banner.columnconfigure(0, weight=1)
+
+        self.banner_label = tk.Label(
+            self.banner,
             textvariable=self.room_banner_var,
             bg="#EFF6FF",
             fg="#1E40AF",
             font=("Segoe UI", 9, "bold"),
             anchor="w",
-        ).pack(fill="x")
+        )
+        self.banner_label.grid(row=0, column=0, sticky="ew")
+
+        self.members_btn = ttk.Button(
+            self.banner,
+            text="👥 Thành viên",
+            style="Secondary.TButton",
+            command=self.open_members_dialog,
+        )
+        self.members_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        self.room_action_btn = ttk.Button(
+            self.banner,
+            text="🚪 Rời phòng",
+            style="Secondary.TButton",
+            command=self.leave_current_room,
+        )
+        self.room_action_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
         self.chat_text = tk.Text(
             chat_card,
@@ -352,6 +400,7 @@ class ChatClientGUI:
         self.chat_text.tag_configure("body", foreground="#0F172A", font=("Segoe UI", 10))
         self.chat_text.tag_configure("recalled", foreground="#94A3B8", font=("Segoe UI", 10, "italic"))
         self.chat_text.tag_configure("file_meta", foreground="#0369A1", font=("Segoe UI", 9, "bold"))
+        self.chat_text.tag_configure("request_notice", foreground="#B45309", font=("Segoe UI", 9, "bold"))
         self.chat_text.tag_configure("system", foreground="#475569", font=("Segoe UI", 9, "italic"))
         self.chat_text.tag_configure("error", foreground="#DC2626", font=("Segoe UI", 9, "bold"))
 
@@ -407,7 +456,7 @@ class ChatClientGUI:
 
         ttk.Label(
             info_bar,
-            text="Enter: Gửi  |  Shift+Enter: Xuống dòng  |  ↩ Thu hồi cạnh tin đã gửi  |  /quit: Rời phòng",
+            text="Enter: Gửi  |  Gõ /// xem thành viên  |  /kick <tên>  |  /leave  |  /quit: Thoát",
             style="Hint.TLabel",
         ).grid(row=0, column=0, sticky="w")
 
@@ -429,10 +478,10 @@ class ChatClientGUI:
         scr_w = self.root.winfo_screenwidth()
         scr_h = self.root.winfo_screenheight()
 
-        min_w = min(req_w + int(24 * dpi_scale), int(scr_w * 0.92))
-        min_h = min(max(req_h, int(460 * dpi_scale)), int(scr_h * 0.88))
-        init_w = min(max(min_w, int(800 * dpi_scale)), int(scr_w * 0.92))
-        init_h = min(max(min_h, int(560 * dpi_scale)), int(scr_h * 0.88))
+        min_w = min(req_w + int(24 * dpi_scale), int(scr_w * 0.94))
+        min_h = min(max(req_h, int(480 * dpi_scale)), int(scr_h * 0.88))
+        init_w = min(max(min_w, int(860 * dpi_scale)), int(scr_w * 0.94))
+        init_h = min(max(min_h, int(580 * dpi_scale)), int(scr_h * 0.88))
 
         self.root.minsize(min_w, min_h)
         self.root.geometry(f"{init_w}x{init_h}")
@@ -449,22 +498,65 @@ class ChatClientGUI:
         self.port_entry.bind("<Return>", lambda _e: self.toggle_connection())
         self.name_entry.bind("<Return>", lambda _e: self.toggle_connection())
 
+    def _update_room_banner_and_action_btn(self) -> None:
+        room = self.current_room
+        owner = self.room_owners.get(room, "")
+        is_priv = room in self.private_rooms
+        priv_badge = "🔒 Riêng tư" if is_priv else "🌐 Công khai"
+        connected = self.client.is_connected
+
+        self.members_btn.configure(state="normal" if connected else "disabled")
+
+        if room == LOBBY_ROOM:
+            self.room_banner_var.set("#chung — Sảnh chung mặc định")
+            self.room_action_btn.grid_remove()
+            return
+
+        if owner and owner == self.active_username:
+            self.room_banner_var.set(f"👑 #{room} [{priv_badge}] — Bạn là Admin phòng")
+            self.room_action_btn.configure(
+                text="🗑️ Xóa phòng",
+                style="Danger.TButton",
+                command=self.delete_current_room,
+                state="normal" if connected else "disabled",
+            )
+            self.room_action_btn.grid()
+        else:
+            owner_desc = f"Admin: {owner}" if owner else "Phòng hệ thống"
+            self.room_banner_var.set(f"#{room} [{priv_badge}] — {owner_desc}")
+            self.room_action_btn.configure(
+                text="🚪 Rời phòng",
+                style="Secondary.TButton",
+                command=self.leave_current_room,
+                state="normal" if connected else "disabled",
+            )
+            self.room_action_btn.grid()
+
     def _populate_room_listbox(self) -> None:
         self._updating_room_listbox = True
         try:
             self.room_listbox.delete(0, "end")
             selected_idx = 0
             for idx, r in enumerate(self.rooms):
-                self.room_listbox.insert("end", f"  # {r}")
+                owner = self.room_owners.get(r, "")
+                is_priv = r in self.private_rooms
+                is_joined = r in self.joined_rooms or owner == self.active_username
+
+                prefix_parts = []
+                if owner and owner == self.active_username:
+                    prefix_parts.append("👑")
+                if is_priv:
+                    prefix_parts.append("🔓" if is_joined else "🔒")
+
+                prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
+                self.room_listbox.insert("end", f"  {prefix}# {r}")
                 if r == self.current_room:
                     selected_idx = idx
             if self.rooms:
                 self.room_listbox.selection_clear(0, "end")
                 self.room_listbox.selection_set(selected_idx)
                 self.room_listbox.see(selected_idx)
-            self.room_banner_var.set(
-                f"#{self.current_room} — Lịch sử SQLite & Trò chuyện trực tuyến"
-            )
+            self._update_room_banner_and_action_btn()
         finally:
             self._updating_room_listbox = False
 
@@ -478,37 +570,127 @@ class ChatClientGUI:
         if 0 <= idx < len(self.rooms):
             chosen = self.rooms[idx]
             if chosen != self.current_room:
-                self._switch_to_room(chosen)
+                self._request_switch_room(chosen, is_private=False)
 
     def create_or_join_room(self) -> None:
         raw_room = self.new_room_var.get()
         norm = normalize_room_name(raw_room)
         if not norm:
-            self.append_error_log("Vui lòng nhập tên phòng hợp lệ (ví dụ: nhom-5, on-thi).")
+            self.append_error_log("Vui lòng nhập tên phòng hợp lệ (ví dụ: nhom-5, hop-kin).")
             self.new_room_entry.focus_set()
             return
+        want_private = bool(self.new_room_private_var.get())
         self.new_room_var.set("")
-        if norm not in self.rooms:
-            self.rooms.append(norm)
-        self._switch_to_room(norm)
+        self.new_room_private_var.set(False)
+        self._request_switch_room(norm, is_private=want_private)
 
-    def _switch_to_room(self, target_room: str) -> None:
-        self.current_room = target_room
-        self._populate_room_listbox()
-        self._refresh_ui_state()
-
+    def _request_switch_room(self, target_room: str, is_private: bool = False) -> None:
         if not self.client.is_connected:
+            if target_room not in self.rooms:
+                self.rooms.append(target_room)
+            if is_private:
+                self.private_rooms.add(target_room)
+            self.current_room = target_room
+            self._explicit_connect_room = target_room
+            self._populate_room_listbox()
             self.append_system_log(
-                f"Đã chọn trước phòng #{target_room}. Bấm 'Kết nối' để vào phòng."
+                f"Đã chọn trước phòng #{target_room}. Bấm 'Kết nối' để vào/tạo phòng."
             )
             return
 
-        self.clear_chat_history()
+        # Giữ highlight phòng hiện tại cho tới khi Server xác nhận cho vào qua gói room_list
+        self._populate_room_listbox()
         try:
-            pkt = encode_message(make_message("join_room", room=target_room))
+            pkt = encode_message(
+                make_message("join_room", room=target_room, is_private=is_private)
+            )
             self.client.send_payload(pkt)
         except Exception as err:
-            self.append_error_log(f"Không thể chuyển sang phòng #{target_room}: {err}")
+            self.append_error_log(f"Không thể gửi yêu cầu vào phòng #{target_room}: {err}")
+
+    def request_members_check(self, open_dialog: bool = False) -> None:
+        if not self.client.is_connected:
+            self.append_error_log("Hãy kết nối tới server trước khi kiểm tra thành viên.")
+            return
+        self._open_dialog_on_next_members = open_dialog
+        try:
+            pkt = encode_message(make_message("get_members", room=self.current_room))
+            self.client.send_payload(pkt)
+        except Exception as err:
+            self.append_error_log(f"Không thể lấy danh sách thành viên: {err}")
+
+    def open_members_dialog(self) -> None:
+        self.request_members_check(open_dialog=True)
+
+    def send_approve_decision(
+        self, room: str, target_user: str, approve: bool, btn_pair: Optional[Tuple[ttk.Button, ttk.Button]] = None
+    ) -> None:
+        if btn_pair is not None:
+            for b in btn_pair:
+                try:
+                    b.configure(state="disabled")
+                except Exception:
+                    pass
+        if not self.client.is_connected:
+            self.append_error_log("Chưa kết nối tới server.")
+            return
+        try:
+            pkt = encode_message(
+                make_message(
+                    "approve_join", room=room, target=target_user, approve=approve
+                )
+            )
+            self.client.send_payload(pkt)
+        except Exception as err:
+            self.append_error_log(f"Không thể gửi phản hồi duyệt: {err}")
+
+    def send_kick_member(self, room: str, target_user: str) -> None:
+        if not self.client.is_connected:
+            self.append_error_log("Chưa kết nối tới server.")
+            return
+        try:
+            pkt = encode_message(
+                make_message("kick_member", room=room, target=target_user)
+            )
+            self.client.send_payload(pkt)
+        except Exception as err:
+            self.append_error_log(f"Không thể kick thành viên: {err}")
+
+    def leave_current_room(self) -> None:
+        if not self.client.is_connected:
+            self.append_error_log("Hãy kết nối tới server trước khi thực hiện.")
+            return
+        if self.current_room == LOBBY_ROOM:
+            return
+        try:
+            pkt = encode_message(make_message("leave_room", room=self.current_room))
+            self.client.send_payload(pkt)
+        except Exception as err:
+            self.append_error_log(f"Không thể rời phòng: {err}")
+
+    def delete_current_room(self, confirm: bool = True) -> None:
+        if not self.client.is_connected:
+            self.append_error_log("Hãy kết nối tới server trước khi thực hiện.")
+            return
+        room = self.current_room
+        if room == LOBBY_ROOM:
+            return
+        if confirm:
+            ok = messagebox.askyesno(
+                "Xác nhận xóa phòng",
+                f"Bạn là Admin của phòng #{room}.\n\n"
+                f"Xóa phòng sẽ xóa vĩnh viễn toàn bộ lịch sử tin nhắn/ảnh của #{room} "
+                f"và đưa tất cả thành viên về sảnh #chung.\n\n"
+                f"Bạn có chắc chắn muốn xóa phòng #{room}?",
+                parent=self.root,
+            )
+            if not ok:
+                return
+        try:
+            pkt = encode_message(make_message("delete_room", room=room))
+            self.client.send_payload(pkt)
+        except Exception as err:
+            self.append_error_log(f"Không thể xóa phòng: {err}")
 
     def _on_text_modified(self, _event: tk.Event) -> None:
         if self.input_text.edit_modified():
@@ -565,12 +747,15 @@ class ChatClientGUI:
             self.host_entry.configure(state="normal")
             self.port_entry.configure(state="normal")
             self.name_entry.configure(state="normal")
-            self.status_var.set(f"● Chưa kết nối (Phòng chờ: #{self.current_room})")
+            self.status_var.set("● Chưa kết nối")
             self.status_label.configure(fg="#64748B")
+
+        self._update_room_banner_and_action_btn()
 
     def _graceful_disconnect(self) -> None:
         self._incoming_files.clear()
         self._outgoing_files.clear()
+        self._explicit_connect_room = None
         if self.client.is_connected:
             try:
                 self.client.send_payload(encode_message(make_message("bye")))
@@ -652,7 +837,6 @@ class ChatClientGUI:
             self.append_error_log(str(err))
 
     def request_recall(self, msg_id: int) -> None:
-        """Gửi yêu cầu thu hồi tin nhắn hoặc tệp theo `msg_id` lên server."""
         if not self.client.is_connected:
             self.append_error_log("Cần đang kết nối với server để thu hồi tin nhắn.")
             return
@@ -674,13 +858,34 @@ class ChatClientGUI:
                 self.append_system_log("Hiện chưa có kết nối nào đang mở.")
             return
 
+        # Lệnh nhanh '///' hoặc '/members' để kiểm tra danh sách thành viên trong phòng
+        if stripped in {"///", "/members"}:
+            self._clear_input()
+            self.request_members_check(open_dialog=False)
+            return
+
+        if stripped.startswith("/kick "):
+            target_user = stripped[6:].strip()
+            self._clear_input()
+            if target_user:
+                self.send_kick_member(self.current_room, target_user)
+            return
+
+        if stripped == "/leave":
+            self._clear_input()
+            self.leave_current_room()
+            return
+
+        if stripped == "/delete":
+            self._clear_input()
+            self.delete_current_room(confirm=True)
+            return
+
         if stripped.startswith("/join "):
             target = normalize_room_name(stripped[6:])
             self._clear_input()
             if target:
-                if target not in self.rooms:
-                    self.rooms.append(target)
-                self._switch_to_room(target)
+                self._request_switch_room(target, is_private=False)
             return
 
         if not self.client.is_connected:
@@ -723,18 +928,21 @@ class ChatClientGUI:
             endpoint = str(data or "")
             self._refresh_ui_state(endpoint=endpoint)
             try:
-                hello_bytes = encode_message(
-                    make_message(
-                        "hello", username=self.active_username, room=self.current_room
+                if self._explicit_connect_room:
+                    hello_pkt = make_message(
+                        "hello",
+                        username=self.active_username,
+                        room=self._explicit_connect_room,
                     )
-                )
-                self.client.send_payload(hello_bytes)
+                    self._explicit_connect_room = None
+                else:
+                    hello_pkt = make_message("hello", username=self.active_username)
+                self.client.send_payload(encode_message(hello_pkt))
             except Exception as err:
                 self.append_error_log(f"Không thể gửi gói hello: {err}")
             self.input_text.focus_set()
 
         elif event_type == EVENT_FILE_SENT:
-            # Đợi gói file_saved kèm msg_id từ server để gắn nút Thu hồi chính xác
             return
 
         elif event_type == EVENT_MESSAGE:
@@ -782,13 +990,30 @@ class ChatClientGUI:
         if mtype == "hello":
             self.active_username = msg["username"]
             self.root.title(f"TCP Socket Chat — {self.active_username}")
+            self._populate_room_listbox()
             self._refresh_ui_state()
 
         elif mtype == "room_list":
+            old_room = self.current_room
             self.rooms = list(msg["rooms"])
+            self.room_owners = dict(msg.get("owners") or {})
+            self.private_rooms = set(msg.get("private_rooms") or [])
+            self.joined_rooms = set(msg.get("joined_rooms") or [LOBBY_ROOM])
             self.current_room = msg["current_room"]
+            if self.current_room != old_room:
+                self.clear_chat_history()
             self._populate_room_listbox()
             self._refresh_ui_state()
+
+        elif mtype == "join_request":
+            self.append_join_request_prompt(
+                room=msg["room"],
+                requester=msg["username"],
+                timestamp=msg.get("timestamp") or now_hhmmss(),
+            )
+
+        elif mtype == "member_list":
+            self._handle_member_list_response(msg)
 
         elif mtype == "chat":
             msg_room = msg.get("room")
@@ -896,6 +1121,198 @@ class ChatClientGUI:
 
         elif mtype == "error":
             self.append_error_log(f"[{msg['code']}] {msg['message']}")
+
+    def _handle_member_list_response(self, msg: dict) -> None:
+        room = msg["room"]
+        owner = msg.get("owner") or ""
+        is_priv = bool(msg.get("is_private", False))
+        members: List[str] = list(msg["members"])
+        online_set = set(msg.get("online_members") or [])
+        pending: List[str] = list(msg.get("pending_requests") or [])
+
+        # In tóm tắt danh sách thành viên trực tiếp lên khung chat (hỗ trợ lệnh ///)
+        formatted = []
+        for m in members:
+            crown = "👑 " if (owner and m == owner) else ""
+            dot = "🟢" if m in online_set else "⚪"
+            formatted.append(f"{dot} {crown}{m}")
+        mode_str = "Riêng tư 🔒" if is_priv else "Công khai 🌐"
+        summary = f"👥 Thành viên #{room} [{mode_str}] ({len(members)} người): " + ", ".join(
+            formatted
+        )
+        if pending:
+            summary += f" | Đang chờ duyệt ({len(pending)}): " + ", ".join(pending)
+        self.append_system_log(summary)
+
+        # Mở hoặc làm mới hộp thoại Quản lý Thành viên nếu người dùng bấm nút '👥 Thành viên' (hoặc hộp thoại đang mở)
+        dialog_alive = (
+            self._members_dialog is not None and self._members_dialog.winfo_exists()
+        )
+        if self._open_dialog_on_next_members or dialog_alive:
+            self._open_dialog_on_next_members = False
+            self._render_members_dialog(
+                room=room,
+                owner=owner,
+                is_private=is_priv,
+                members=members,
+                online_set=online_set,
+                pending=pending,
+            )
+
+    def _render_members_dialog(
+        self,
+        room: str,
+        owner: str,
+        is_private: bool,
+        members: List[str],
+        online_set: Set[str],
+        pending: List[str],
+    ) -> None:
+        if self._members_dialog is None or not self._members_dialog.winfo_exists():
+            dlg = tk.Toplevel(self.root)
+            dlg.configure(bg="#F8FAFC")
+            dlg.transient(self.root)
+            dpi_scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+            dlg.geometry(f"{int(440 * dpi_scale)}x{int(400 * dpi_scale)}")
+            self._members_dialog = dlg
+            self._members_body_frame = tk.Frame(dlg, bg="#F8FAFC", padx=14, pady=12)
+            self._members_body_frame.pack(fill="both", expand=True)
+
+        assert self._members_dialog is not None and self._members_body_frame is not None
+        mode_text = "Riêng tư 🔒" if is_private else "Công khai 🌐"
+        self._members_dialog.title(f"Thành viên #{room} ({mode_text})")
+
+        for child in self._members_body_frame.winfo_children():
+            child.destroy()
+
+        is_admin = bool(owner and owner == self.active_username)
+
+        tk.Label(
+            self._members_body_frame,
+            text=f"DANH SÁCH THÀNH VIÊN #{room.upper()} ({len(members)})",
+            bg="#F8FAFC",
+            fg="#0F172A",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        list_card = tk.Frame(
+            self._members_body_frame,
+            bg="#FFFFFF",
+            highlightbackground="#CBD5E1",
+            highlightthickness=1,
+            padx=10,
+            pady=8,
+        )
+        list_card.pack(fill="both", expand=True)
+
+        for member in members:
+            row = tk.Frame(list_card, bg="#FFFFFF", pady=3)
+            row.pack(fill="x")
+            status_icon = "🟢 Đang ở phòng" if member in online_set else "⚪ Đã tham gia"
+            role_icon = "👑 Admin" if (owner and member == owner) else "Thành viên"
+            tk.Label(
+                row,
+                text=f"{member}  —  {role_icon} ({status_icon})",
+                bg="#FFFFFF",
+                fg="#0F172A" if member in online_set else "#64748B",
+                font=("Segoe UI", 9, "bold" if member == owner else "normal"),
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True)
+
+            if is_admin and member != self.active_username:
+                ttk.Button(
+                    row,
+                    text="🚫 Kick",
+                    style="Reject.TButton",
+                    command=lambda u=member, r=room: self.send_kick_member(r, u),
+                ).pack(side="right")
+
+        if is_admin and pending:
+            tk.Label(
+                self._members_body_frame,
+                text=f"YÊU CẦU XIN VÀO PHÒNG ({len(pending)})",
+                bg="#F8FAFC",
+                fg="#B45309",
+                font=("Segoe UI", 9, "bold"),
+                anchor="w",
+            ).pack(fill="x", pady=(10, 4))
+
+            req_card = tk.Frame(
+                self._members_body_frame,
+                bg="#FFFBEB",
+                highlightbackground="#FCD34D",
+                highlightthickness=1,
+                padx=10,
+                pady=6,
+            )
+            req_card.pack(fill="x")
+
+            for req_user in pending:
+                rrow = tk.Frame(req_card, bg="#FFFBEB", pady=2)
+                rrow.pack(fill="x")
+                tk.Label(
+                    rrow,
+                    text=f"🔔 {req_user} xin vào #{room}",
+                    bg="#FFFBEB",
+                    fg="#92400E",
+                    font=("Segoe UI", 9, "bold"),
+                ).pack(side="left", fill="x", expand=True)
+
+                ttk.Button(
+                    rrow,
+                    text="❌ Từ chối",
+                    style="Reject.TButton",
+                    command=lambda u=req_user, r=room: self.send_approve_decision(
+                        r, u, False
+                    ),
+                ).pack(side="right", padx=(4, 0))
+                ttk.Button(
+                    rrow,
+                    text="✅ Duyệt",
+                    style="Approve.TButton",
+                    command=lambda u=req_user, r=room: self.send_approve_decision(
+                        r, u, True
+                    ),
+                ).pack(side="right")
+
+    def append_join_request_prompt(
+        self, room: str, requester: str, timestamp: str
+    ) -> None:
+        """Hiển thị thông báo xin vào phòng kèm nút Duyệt / Từ chối ngay trong khung chat của Admin."""
+        self.chat_text.configure(state="normal")
+        self.chat_text.insert("end", f"[{timestamp}] ", "time")
+        self.chat_text.insert(
+            "end",
+            f"🔔 '{requester}' xin tham gia phòng riêng tư #{room}  ",
+            "request_notice",
+        )
+
+        approve_btn = ttk.Button(
+            self.chat_text, text="✅ Duyệt", style="Approve.TButton"
+        )
+        reject_btn = ttk.Button(
+            self.chat_text, text="❌ Từ chối", style="Reject.TButton"
+        )
+        pair = (approve_btn, reject_btn)
+        approve_btn.configure(
+            command=lambda r=room, u=requester, p=pair: self.send_approve_decision(
+                r, u, True, p
+            )
+        )
+        reject_btn.configure(
+            command=lambda r=room, u=requester, p=pair: self.send_approve_decision(
+                r, u, False, p
+            )
+        )
+        self._widget_refs.extend([approve_btn, reject_btn])
+
+        self.chat_text.window_create("end", window=approve_btn)
+        self.chat_text.insert("end", " ")
+        self.chat_text.window_create("end", window=reject_btn)
+        self.chat_text.insert("end", "\n")
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
 
     def _try_build_image_preview(self, filename: str, file_bytes: bytes):
         if not file_bytes:
@@ -1077,7 +1494,6 @@ class ChatClientGUI:
         self.chat_text.configure(state="disabled")
 
     def apply_message_recall(self, msg_id: int, sender: str, timestamp: str) -> None:
-        """Xóa ngay nội dung, hình ảnh & nút bấm của tin nhắn `msg_id` tại chỗ trên khung chat."""
         tag_name = f"msg_{msg_id}"
         ranges = self.chat_text.tag_ranges(tag_name)
         if not ranges:

@@ -1,9 +1,10 @@
-"""Server Chat đa luồng: Chia phòng + Truyền File/Ảnh nhị phân + Lưu lịch sử SQLite + Thu hồi tin nhắn.
+"""Server Chat đa luồng: Phòng Public/Private + Duyệt/Kick thành viên + File nhị phân + SQLite + Thu hồi tin.
 
-Tích hợp đầy đủ:
-- Tầng framing TCP (`transport.py`): 4-byte header big-endian + N-byte payload (<= 64 KiB/frame).
-- Tầng giao thức (`protocol.py`): Gói điều khiển JSON UTF-8 + Gói dữ liệu nhị phân (`BINARY_MAGIC`).
-- Tầng lưu trữ (`storage.py`): SQLite `chat_history.db` lưu phòng, lịch sử chat/file và trạng thái thu hồi.
+Các cơ chế quản trị phòng:
+- Phòng có 2 chế độ: Công khai (Public) và Riêng tư (Private) do người tạo phòng (Admin) chọn.
+- Phòng Private (hoặc người từng bị kick): muốn vào phải gửi yêu cầu (`join_request`) và chờ Admin duyệt (`approve_join`).
+- Admin có quyền `kick_member` để mời thành viên không mong muốn ra khỏi phòng và `delete_room` để giải tán phòng.
+- Mọi thành viên có thể kiểm tra danh sách thành viên & trạng thái online của phòng (`get_members` / `///`).
 
 Chạy server:
     py chat_server.py
@@ -30,10 +31,10 @@ from protocol import (
     make_message,
     normalize_room_name,
 )
-from storage import DEFAULT_DB_PATH, ChatStorage
+from storage import DEFAULT_DB_PATH, LOBBY_ROOM, ChatStorage
 from transport import recv_msg, send_msg
 
-DEFAULT_ROOM = "chung"
+DEFAULT_ROOM = LOBBY_ROOM
 HISTORY_REPLAY_LIMIT = 40
 
 
@@ -74,7 +75,7 @@ class ClientSession:
 
 
 class ChatRoomServer:
-    """TCP Chat Server hỗ trợ nhiều phòng chat, gửi file nhị phân, lưu lịch sử SQLite & thu hồi tin nhắn."""
+    """TCP Chat Server hỗ trợ phòng Public/Private, duyệt/kick thành viên, gửi file nhị phân, SQLite & thu hồi tin."""
 
     def __init__(
         self,
@@ -114,7 +115,7 @@ class ChatRoomServer:
         assert self._server_sock is not None
         rooms_str = ", ".join(f"#{r}" for r in self.storage.list_rooms())
         self._log(f"[READY] Chat Server lắng nghe tại {self.host}:{self.port}")
-        self._log(f"[SQLITE] Đã kết nối DB ({self.storage.db_path}) | Phòng sẵn có: {rooms_str}")
+        self._log(f"[SQLITE] Đã kết nối DB ({self.storage.db_path}) | Phòng hiện có: {rooms_str}")
 
         while self._running:
             try:
@@ -168,6 +169,14 @@ class ChatRoomServer:
     def _send_to(self, session: ClientSession, message: dict) -> bool:
         return self._send_raw_to(session, encode_message(message))
 
+    def _find_session_by_username(self, username: str) -> Optional[ClientSession]:
+        clean = username.strip()
+        with self._lock:
+            for s in self._clients.values():
+                if s.welcomed and s.username == clean:
+                    return s
+        return None
+
     def _room_sessions(
         self, room: str, exclude_sock: Optional[socket.socket] = None
     ) -> List[ClientSession]:
@@ -189,15 +198,75 @@ class ChatRoomServer:
                 sent += 1
         return sent
 
+    def _send_room_list_to(self, session: ClientSession) -> None:
+        info = self.storage.list_rooms_for_user(session.username)
+        self._send_to(
+            session,
+            make_message(
+                "room_list",
+                rooms=list(info["rooms"]),
+                current_room=session.room,
+                owners=dict(info["owners"]),
+                private_rooms=list(info["private_rooms"]),
+                joined_rooms=list(info["joined_rooms"]),
+            ),
+        )
+
     def _sync_room_list_all(self) -> None:
-        rooms = self.storage.list_rooms()
         with self._lock:
             welcomed_sessions = [s for s in self._clients.values() if s.welcomed]
         for target in welcomed_sessions:
+            self._send_room_list_to(target)
+
+    def _send_member_list_to(self, session: ClientSession, raw_room: str) -> None:
+        norm_room = normalize_room_name(raw_room) or session.room
+        info = self.storage.get_room_info_and_members(norm_room)
+        if info is None:
             self._send_to(
-                target,
-                make_message("room_list", rooms=rooms, current_room=target.room),
+                session,
+                make_message(
+                    "error", code="ROOM_NOT_FOUND", message=f"Phòng #{norm_room} không tồn tại."
+                ),
             )
+            return
+
+        owner = str(info["owner"])
+        is_priv = bool(info["is_private"])
+        stored_members = list(info["members"])
+
+        # Nếu là phòng Private mà người hỏi chưa phải thành viên -> từ chối tiết lộ danh sách nội bộ
+        if is_priv and session.username != owner and session.username not in stored_members:
+            self._send_to(
+                session,
+                make_message(
+                    "error",
+                    code="PRIVATE_ROOM",
+                    message=f"Bạn cần là thành viên của phòng riêng tư #{norm_room} để xem danh sách thành viên.",
+                ),
+            )
+            return
+
+        online_in_room = [s.username for s in self._room_sessions(norm_room)]
+        merged_members: List[str] = []
+        for u in ([owner] if owner else []) + online_in_room + stored_members:
+            if u and u not in merged_members:
+                merged_members.append(u)
+        if not merged_members:
+            merged_members = [session.username]
+
+        pending = list(info["pending_requests"]) if session.username == owner else []
+        self._send_to(
+            session,
+            make_message(
+                "member_list",
+                room=norm_room,
+                owner=owner,
+                is_private=is_priv,
+                members=merged_members,
+                online_members=online_in_room,
+                pending_requests=pending,
+            ),
+        )
 
     def _stream_file_to_sessions(
         self,
@@ -250,23 +319,117 @@ class ChatRoomServer:
                 delivered += 1
         return delivered
 
-    def _enter_room(
-        self, session: ClientSession, requested_room: str, initial: bool = False
-    ) -> None:
-        rooms_before = set(self.storage.list_rooms())
-        target_room = self.storage.ensure_room(requested_room)
-        is_new_room = target_room not in rooms_before
-        old_room = session.room
+    def _replay_room_history(self, session: ClientSession, room: str) -> int:
+        history = self.storage.get_recent_history(room, limit=HISTORY_REPLAY_LIMIT)
+        for item in history:
+            mid = int(item["id"])
+            if item.get("recalled"):
+                self._send_to(
+                    session,
+                    make_message(
+                        "chat",
+                        text="",
+                        sender=str(item["sender"]),
+                        room=room,
+                        timestamp=str(item["timestamp"]),
+                        history=True,
+                        msg_id=mid,
+                        recalled=True,
+                    ),
+                )
+            elif item["msg_type"] == "chat":
+                self._send_to(
+                    session,
+                    make_message(
+                        "chat",
+                        text=str(item["content"]),
+                        sender=str(item["sender"]),
+                        room=room,
+                        timestamp=str(item["timestamp"]),
+                        history=True,
+                        msg_id=mid,
+                    ),
+                )
+            elif item["msg_type"] == "file" and isinstance(item["file_data"], bytes):
+                self._stream_file_to_sessions(
+                    targets=[session],
+                    filename=str(item["content"]),
+                    file_bytes=item["file_data"],
+                    sender=str(item["sender"]),
+                    room=room,
+                    timestamp=str(item["timestamp"]),
+                    msg_id=mid,
+                    is_history=True,
+                )
+        return len(history)
 
-        if not initial and old_room == target_room:
+    def _enter_room(
+        self,
+        session: ClientSession,
+        requested_room: str,
+        is_private: bool = False,
+        initial: bool = False,
+    ) -> None:
+        res = self.storage.try_enter_or_create_room(
+            requested_room, username=session.username, is_private=is_private
+        )
+
+        # Trường hợp phòng Private (hoặc từng bị kick) -> Gửi yêu cầu tới Admin và giữ nguyên phòng hiện tại
+        if res["status"] == "pending_approval":
+            target_room = str(res["room"])
+            owner = str(res["owner"])
+            if initial:
+                self._enter_room(session, DEFAULT_ROOM, is_private=False, initial=True)
+
+            self._send_room_list_to(session)
+
+            if res.get("is_banned"):
+                notice = (
+                    f"🔒 Bạn đã từng bị kick khỏi phòng #{target_room}. "
+                    f"Đã gửi yêu cầu xin vào lại cho Admin ({owner}), vui lòng chờ duyệt."
+                )
+            else:
+                notice = (
+                    f"🔒 Phòng #{target_room} là phòng riêng tư (Private). "
+                    f"Đã gửi yêu cầu tham gia tới Admin ({owner}), vui lòng chờ duyệt!"
+                )
+
             self._send_to(
                 session,
                 make_message(
-                    "room_list",
-                    rooms=self.storage.list_rooms(),
-                    current_room=target_room,
+                    "chat",
+                    text=notice,
+                    room=session.room,
+                    system=True,
+                    timestamp=now_hhmmss(),
                 ),
             )
+
+            if not res.get("already_pending"):
+                admin_sess = self._find_session_by_username(owner)
+                if admin_sess is not None:
+                    self._send_to(
+                        admin_sess,
+                        make_message(
+                            "join_request",
+                            room=target_room,
+                            username=session.username,
+                            timestamp=now_hhmmss(),
+                        ),
+                    )
+                self._log(
+                    f"[JOIN REQUEST] '{session.username}' gửi yêu cầu vào #{target_room} (Admin={owner})"
+                )
+            return
+
+        target_room = str(res["room"])
+        is_new_room = bool(res["is_new"])
+        owner = str(res["owner"])
+        room_priv = bool(res["is_private"])
+        old_room = session.room
+
+        if not initial and old_room == target_room:
+            self._send_room_list_to(session)
             return
 
         if not initial and old_room != target_room:
@@ -286,73 +449,47 @@ class ChatRoomServer:
             session.room = target_room
 
         if is_new_room:
-            self._log(f"[NEW ROOM] '{session.username}' đã tạo phòng mới #{target_room}")
+            mode_tag = "PRIVATE 🔒" if room_priv else "PUBLIC 🌐"
+            self._log(
+                f"[NEW ROOM] '{session.username}' tạo phòng #{target_room} [{mode_tag}] (Admin={owner})"
+            )
             self._sync_room_list_all()
         else:
-            self._send_to(
-                session,
-                make_message(
-                    "room_list",
-                    rooms=self.storage.list_rooms(),
-                    current_room=target_room,
-                ),
-            )
+            self._send_room_list_to(session)
 
-        # Nạp lịch sử tin nhắn, file & trạng thái thu hồi từ SQLite cho người vừa vào phòng
-        history = self.storage.get_recent_history(target_room, limit=HISTORY_REPLAY_LIMIT)
-        for item in history:
-            mid = int(item["id"])
-            if item.get("recalled"):
-                self._send_to(
-                    session,
-                    make_message(
-                        "chat",
-                        text="",
-                        sender=str(item["sender"]),
-                        room=target_room,
-                        timestamp=str(item["timestamp"]),
-                        history=True,
-                        msg_id=mid,
-                        recalled=True,
-                    ),
-                )
-            elif item["msg_type"] == "chat":
-                self._send_to(
-                    session,
-                    make_message(
-                        "chat",
-                        text=str(item["content"]),
-                        sender=str(item["sender"]),
-                        room=target_room,
-                        timestamp=str(item["timestamp"]),
-                        history=True,
-                        msg_id=mid,
-                    ),
-                )
-            elif item["msg_type"] == "file" and isinstance(item["file_data"], bytes):
-                self._stream_file_to_sessions(
-                    targets=[session],
-                    filename=str(item["content"]),
-                    file_bytes=item["file_data"],
-                    sender=str(item["sender"]),
-                    room=target_room,
-                    timestamp=str(item["timestamp"]),
-                    msg_id=mid,
-                    is_history=True,
-                )
-
+        hist_count = self._replay_room_history(session, target_room)
         room_count = len(self._room_sessions(target_room))
-        hist_note = f" — Đã tải {len(history)} mục lịch sử từ SQLite" if history else ""
+        priv_label = " [Riêng tư 🔒]" if room_priv else ""
+        role_note = (
+            " — Bạn là 👑 Admin phòng"
+            if owner and owner == session.username
+            else (f" — Admin: {owner}" if owner else "")
+        )
+        hist_note = f" — Đã tải {hist_count} mục lịch sử từ SQLite" if hist_count else ""
+
         self._send_to(
             session,
             make_message(
                 "chat",
-                text=f"Đang ở phòng #{target_room} ({room_count} người trong phòng{hist_note}).",
+                text=f"Đang ở phòng #{target_room}{priv_label} ({room_count} người trong phòng{role_note}{hist_note}).",
                 room=target_room,
                 system=True,
                 timestamp=now_hhmmss(),
             ),
         )
+
+        # Nếu Admin vừa đăng nhập, đẩy lại các yêu cầu xin vào phòng đang chờ duyệt (nếu có)
+        if initial:
+            for req in self.storage.get_pending_requests_for_admin(session.username):
+                self._send_to(
+                    session,
+                    make_message(
+                        "join_request",
+                        room=req["room"],
+                        username=req["username"],
+                        timestamp=req["timestamp"],
+                    ),
+                )
 
         self._broadcast_room_json(
             target_room,
@@ -364,6 +501,247 @@ class ChatRoomServer:
                 timestamp=now_hhmmss(),
             ),
             exclude_sock=session.sock,
+        )
+
+    def _handle_approve_join(
+        self, session: ClientSession, raw_room: str, target_user: str, approve: bool
+    ) -> None:
+        norm_room = normalize_room_name(raw_room)
+        clean_target = target_user.strip()
+        ok, err_msg = self.storage.resolve_join_request(
+            norm_room,
+            admin_user=session.username,
+            target_user=clean_target,
+            approve=approve,
+        )
+        if not ok:
+            self._send_to(
+                session, make_message("error", code="APPROVE_DENIED", message=err_msg)
+            )
+            return
+
+        target_sess = self._find_session_by_username(clean_target)
+        if approve:
+            self._send_to(
+                session,
+                make_message(
+                    "chat",
+                    text=f"✅ Đã duyệt '{clean_target}' vào phòng #{norm_room}.",
+                    room=session.room,
+                    system=True,
+                    timestamp=now_hhmmss(),
+                ),
+            )
+            if target_sess is not None:
+                self._enter_room(target_sess, norm_room, initial=False)
+                self._send_to(
+                    target_sess,
+                    make_message(
+                        "chat",
+                        text=f"🎉 Admin ({session.username}) đã duyệt bạn vào phòng #{norm_room}!",
+                        room=norm_room,
+                        system=True,
+                        timestamp=now_hhmmss(),
+                    ),
+                )
+            self._log(
+                f"[APPROVED] Admin '{session.username}' duyệt '{clean_target}' vào #{norm_room}"
+            )
+        else:
+            self._send_to(
+                session,
+                make_message(
+                    "chat",
+                    text=f"❌ Đã từ chối yêu cầu vào phòng #{norm_room} của '{clean_target}'.",
+                    room=session.room,
+                    system=True,
+                    timestamp=now_hhmmss(),
+                ),
+            )
+            if target_sess is not None:
+                self._send_to(
+                    target_sess,
+                    make_message(
+                        "chat",
+                        text=f"❌ Yêu cầu tham gia phòng #{norm_room} đã bị Admin ({session.username}) từ chối.",
+                        room=target_sess.room,
+                        system=True,
+                        timestamp=now_hhmmss(),
+                    ),
+                )
+            self._log(
+                f"[REJECTED] Admin '{session.username}' từ chối '{clean_target}' vào #{norm_room}"
+            )
+
+        self._send_member_list_to(session, norm_room)
+
+    def _handle_kick_member(
+        self, session: ClientSession, raw_room: str, target_user: str
+    ) -> None:
+        norm_room = normalize_room_name(raw_room)
+        clean_target = target_user.strip()
+        ok, err_msg = self.storage.kick_member(
+            norm_room, admin_user=session.username, target_user=clean_target
+        )
+        if not ok:
+            self._send_to(
+                session, make_message("error", code="KICK_DENIED", message=err_msg)
+            )
+            return
+
+        target_sess = self._find_session_by_username(clean_target)
+        was_in_room = target_sess is not None and target_sess.room == norm_room
+        if was_in_room and target_sess is not None:
+            target_sess.room = DEFAULT_ROOM
+
+        # Thông báo cho các thành viên còn lại trong phòng (bao gồm cả Admin)
+        self._broadcast_room_json(
+            norm_room,
+            make_message(
+                "chat",
+                text=f"🚫 '{clean_target}' đã bị Admin ({session.username}) kick khỏi phòng #{norm_room}.",
+                room=norm_room,
+                system=True,
+                timestamp=now_hhmmss(),
+            ),
+            exclude_sock=None,
+        )
+        if session.room != norm_room:
+            self._send_to(
+                session,
+                make_message(
+                    "chat",
+                    text=f"🚫 Đã kick '{clean_target}' khỏi phòng #{norm_room}.",
+                    room=session.room,
+                    system=True,
+                    timestamp=now_hhmmss(),
+                ),
+            )
+
+        # Đưa người bị kick về sảnh #chung ngay lập tức và cập nhật khóa phòng trên danh sách
+        if target_sess is not None:
+            self._send_room_list_to(target_sess)
+            if was_in_room:
+                self._replay_room_history(target_sess, DEFAULT_ROOM)
+            self._send_to(
+                target_sess,
+                make_message(
+                    "chat",
+                    text=f"🚫 Bạn đã bị Admin ({session.username}) kick khỏi phòng #{norm_room}.",
+                    room=target_sess.room,
+                    system=True,
+                    timestamp=now_hhmmss(),
+                ),
+            )
+
+        self._send_member_list_to(session, norm_room)
+        self._log(
+            f"[KICK] Admin '{session.username}' đã kick '{clean_target}' khỏi #{norm_room}"
+        )
+
+    def _handle_leave_room(self, session: ClientSession, raw_room: str) -> None:
+        norm_room = normalize_room_name(raw_room)
+        ok, err_msg = self.storage.leave_room(norm_room, username=session.username)
+        if not ok:
+            self._send_to(
+                session, make_message("error", code="LEAVE_DENIED", message=err_msg)
+            )
+            return
+
+        was_in_room = session.room == norm_room
+        if was_in_room:
+            session.room = DEFAULT_ROOM
+
+        self._broadcast_room_json(
+            norm_room,
+            make_message(
+                "chat",
+                text=f"{session.username} đã rời khỏi phòng #{norm_room}.",
+                room=norm_room,
+                system=True,
+                timestamp=now_hhmmss(),
+            ),
+            exclude_sock=session.sock,
+        )
+
+        self._send_room_list_to(session)
+        if was_in_room:
+            self._replay_room_history(session, DEFAULT_ROOM)
+            self._send_to(
+                session,
+                make_message(
+                    "chat",
+                    text=f"Bạn đã rời khỏi phòng #{norm_room} và quay về sảnh #{DEFAULT_ROOM}.",
+                    room=DEFAULT_ROOM,
+                    system=True,
+                    timestamp=now_hhmmss(),
+                ),
+            )
+            self._broadcast_room_json(
+                DEFAULT_ROOM,
+                make_message(
+                    "chat",
+                    text=f"{session.username} đã quay về sảnh #{DEFAULT_ROOM}.",
+                    room=DEFAULT_ROOM,
+                    system=True,
+                    timestamp=now_hhmmss(),
+                ),
+                exclude_sock=session.sock,
+            )
+
+        self._log(f"[LEAVE ROOM] '{session.username}' đã rời khỏi phòng #{norm_room}")
+
+    def _handle_delete_room(self, session: ClientSession, raw_room: str) -> None:
+        norm_room = normalize_room_name(raw_room)
+        ok, err_msg = self.storage.delete_room(norm_room, requester=session.username)
+        if not ok:
+            self._send_to(
+                session, make_message("error", code="DELETE_DENIED", message=err_msg)
+            )
+            return
+
+        evicted = self._room_sessions(norm_room)
+        evicted_socks = {s.sock for s in evicted}
+        for s in evicted:
+            s.room = DEFAULT_ROOM
+            self.storage.set_user_last_room(s.username, DEFAULT_ROOM)
+
+        self._sync_room_list_all()
+
+        ts = now_hhmmss()
+        for s in evicted:
+            self._replay_room_history(s, DEFAULT_ROOM)
+            self._send_to(
+                s,
+                make_message(
+                    "chat",
+                    text=f"Phòng #{norm_room} đã bị Admin ({session.username}) xóa đối với tất cả mọi người. Đã chuyển về #{DEFAULT_ROOM}.",
+                    room=DEFAULT_ROOM,
+                    system=True,
+                    timestamp=ts,
+                ),
+            )
+
+        with self._lock:
+            others = [
+                s
+                for sock, s in self._clients.items()
+                if s.welcomed and sock not in evicted_socks
+            ]
+        for other in others:
+            self._send_to(
+                other,
+                make_message(
+                    "chat",
+                    text=f"Phòng #{norm_room} đã bị Admin ({session.username}) giải tán.",
+                    room=other.room,
+                    system=True,
+                    timestamp=ts,
+                ),
+            )
+
+        self._log(
+            f"[DELETE ROOM] Admin '{session.username}' đã xóa vĩnh viễn phòng #{norm_room} (chuyển {len(evicted)} người về #{DEFAULT_ROOM})"
         )
 
     def _handle_binary_frame(self, session: ClientSession, raw: bytes) -> None:
@@ -444,7 +822,6 @@ class ChatRoomServer:
             file_bytes=assembled,
             timestamp=ts,
         )
-        # Xác nhận mã msg_id về cho chính người gửi (không cần tải ngược lại toàn bộ dữ liệu nhị phân)
         self._send_to(
             session,
             make_message(
@@ -455,7 +832,6 @@ class ChatRoomServer:
                 timestamp=ts,
             ),
         )
-        # Chuyển tiếp các mảnh nhị phân kèm msg_id tới các thành viên khác trong cùng phòng
         peers = self._room_sessions(transfer.room, exclude_sock=session.sock)
         sent_count = self._stream_file_to_sessions(
             targets=peers,
@@ -505,9 +881,12 @@ class ChatRoomServer:
                         msg["username"].strip(), conn
                     )
                     session.welcomed = True
-                    desired_room = normalize_room_name(msg.get("room", DEFAULT_ROOM)) or DEFAULT_ROOM
+                    explicit_room = normalize_room_name(msg.get("room", ""))
+                    desired_room = explicit_room or self.storage.get_user_last_room(
+                        session.username
+                    )
                     self._send_to(session, make_message("hello", username=session.username))
-                    self._enter_room(session, desired_room, initial=True)
+                    self._enter_room(session, desired_room, is_private=False, initial=True)
                     self._log(
                         f"[HELLO] Đăng ký '{session.username}' vào phòng #{session.room}"
                     )
@@ -521,10 +900,44 @@ class ChatRoomServer:
                             ),
                         )
                         continue
-                    self._enter_room(session, msg["room"], initial=False)
-                    self._log(
-                        f"[JOIN ROOM] '{session.username}' chuyển tới phòng #{session.room}"
+                    self._enter_room(
+                        session,
+                        msg["room"],
+                        is_private=bool(msg.get("is_private", False)),
+                        initial=False,
                     )
+
+                elif msg_type == "approve_join":
+                    if not session.welcomed:
+                        continue
+                    self._handle_approve_join(
+                        session,
+                        raw_room=msg["room"],
+                        target_user=msg["target"],
+                        approve=bool(msg["approve"]),
+                    )
+
+                elif msg_type == "kick_member":
+                    if not session.welcomed:
+                        continue
+                    self._handle_kick_member(
+                        session, raw_room=msg["room"], target_user=msg["target"]
+                    )
+
+                elif msg_type == "get_members":
+                    if not session.welcomed:
+                        continue
+                    self._send_member_list_to(session, msg["room"])
+
+                elif msg_type == "leave_room":
+                    if not session.welcomed:
+                        continue
+                    self._handle_leave_room(session, msg["room"])
+
+                elif msg_type == "delete_room":
+                    if not session.welcomed:
+                        continue
+                    self._handle_delete_room(session, msg["room"])
 
                 elif msg_type == "chat":
                     content = msg["text"]
@@ -533,7 +946,6 @@ class ChatRoomServer:
                     msg_id = self.storage.save_chat(
                         room=room, sender=session.username, text=content, timestamp=ts
                     )
-                    # Gửi tới tất cả thành viên trong phòng (gồm cả người gửi để đồng bộ msg_id phục vụ thu hồi)
                     recipients = self._broadcast_room_json(
                         room,
                         make_message(
@@ -623,7 +1035,7 @@ class ChatRoomServer:
                     removed.room,
                     make_message(
                         "chat",
-                        text=f"{removed.username} đã rời phòng #{removed.room} (còn {remaining} người trong phòng).",
+                        text=f"{removed.username} đã ngắt kết nối khỏi phòng #{removed.room} (còn {remaining} người trong phòng).",
                         room=removed.room,
                         system=True,
                         timestamp=now_hhmmss(),

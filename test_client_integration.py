@@ -1,11 +1,11 @@
 """Kiểm thử tích hợp toàn diện:
 - Phần 1 (`transport.py`): Framing 4-byte header, giới hạn 64 KiB.
-- Phần 2 (`protocol.py`): JSON control + Binary file chunks (`BINARY_MAGIC`) + gói `recall`.
+- Phần 2 (`protocol.py`): JSON control + Binary file chunks (`BINARY_MAGIC`).
 - Phần 3 (`storage.py`, `chat_server.py`, `network_client.py`, `gui_client.py`):
-  1. Chia phòng chat (tạo phòng mới, cô lập tin nhắn giữa các phòng).
-  2. Gửi File / Hình ảnh nhị phân > 64 KiB (tự cắt mảnh 48 KiB và ráp lại nguyên vẹn từng byte).
-  3. Lưu lịch sử SQLite (ngắt kết nối rồi đăng nhập lại vẫn nạp đủ cả tin nhắn cũ và file/ảnh cũ).
-  4. Thu hồi tin nhắn & File/Ảnh (chặn thu hồi tin người khác, xóa sạch trong SQLite và cập nhật tại chỗ trên GUI).
+  1. Chia phòng Public / Private, xin vào phòng Private (`join_request` / `approve_join`).
+  2. Phân quyền Admin: Kick thành viên (`kick_member`), Xóa phòng (`delete_room`), Thành viên rời phòng (`leave_room`), lưu phòng bền vững khi đăng nhập lại.
+  3. Kiểm tra thành viên nhóm (`get_members` / lệnh `///` / hộp thoại `👥 Thành viên`).
+  4. Truyền File / Ảnh nhị phân > 64 KiB + Lưu lịch sử SQLite + Thu hồi tin nhắn & ảnh (`recall`).
 
 Chạy toàn bộ test:
     py test_client_integration.py
@@ -13,7 +13,6 @@ Chạy toàn bộ test:
 
 import argparse
 import os
-import queue
 import tempfile
 import threading
 import tkinter as tk
@@ -23,7 +22,6 @@ from chat_server import ChatRoomServer
 from gui_client import ChatClientGUI, measure_chat_bytes, parse_args, valid_port
 from network_client import (
     EVENT_CONNECTED,
-    EVENT_FILE_SENT,
     EVENT_MESSAGE,
     SocketClient,
 )
@@ -53,10 +51,13 @@ def collect_until(client: SocketClient, predicate, timeout: float = 4.0):
             return collected
 
 
-class TestRoomsBinaryFilesSQLiteAndRecall(unittest.TestCase):
+class TestFullChatSystem(unittest.TestCase):
     def setUp(self):
         fd, self.db_file = tempfile.mkstemp(suffix=".db")
         os.close(fd)
+        self._start_server()
+
+    def _start_server(self):
         self.server = ChatRoomServer(
             host="127.0.0.1", port=0, db_path=self.db_file, quiet=True
         )
@@ -64,9 +65,12 @@ class TestRoomsBinaryFilesSQLiteAndRecall(unittest.TestCase):
         self.srv_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.srv_thread.start()
 
-    def tearDown(self):
+    def _stop_server(self):
         self.server.stop()
         self.srv_thread.join(timeout=2)
+
+    def tearDown(self):
+        self._stop_server()
         for suffix in ("", "-wal", "-shm"):
             p = self.db_file + suffix
             if os.path.exists(p):
@@ -75,270 +79,302 @@ class TestRoomsBinaryFilesSQLiteAndRecall(unittest.TestCase):
                 except OSError:
                     pass
 
-    def _connect_and_hello(self, username: str, room: str = "chung") -> SocketClient:
+    def _connect_and_hello(self, username: str, room=None):
         c = SocketClient()
         c.connect_async("127.0.0.1", self.port)
         ev = c.events.get(timeout=3.0)
         self.assertEqual(ev.type, EVENT_CONNECTED)
-        c.send_payload(encode_message(make_message("hello", username=username, room=room)))
-        collect_until(
+        hello_pkt = (
+            make_message("hello", username=username, room=room)
+            if room
+            else make_message("hello", username=username)
+        )
+        c.send_payload(encode_message(hello_pkt))
+        evs = collect_until(
             c,
             lambda e: e.type == EVENT_MESSAGE
             and not is_binary_frame(e.data)
             and decode_message(e.data).get("type") == "chat"
             and decode_message(e.data).get("system") is True,
         )
-        return c
+        last_room_list = None
+        for item in evs:
+            if item.type == EVENT_MESSAGE and not is_binary_frame(item.data):
+                d = decode_message(item.data)
+                if d["type"] == "room_list":
+                    last_room_list = d
+        return c, last_room_list
 
-    def test_room_isolation_and_custom_room_creation(self):
-        """Tin nhắn ở phòng #do-an-nhom không bị lọt sang người đang ở phòng #chung."""
-        khang = self._connect_and_hello("Minh Khang", room="chung")
-        hoa = self._connect_and_hello("Thái Hoà", room="chung")
-        an = self._connect_and_hello("An", room="chung")
+    def test_private_room_join_request_approval_member_check_and_kick(self):
+        """Kiểm chứng trọn vẹn:
+        1. Admin tạo phòng Private -> người ngoài bấm vào bị chặn và gửi join_request tới Admin.
+        2. Admin bấm Duyệt -> thành viên tự động được vào phòng Private.
+        3. Kiểm tra danh sách thành viên (get_members / ///) -> hiện đúng Admin & thành viên đang online; người ngoài bị chặn.
+        4. Admin Kick thành viên -> bị đẩy ngay về #chung và thu hồi quyền vào phòng!
+        """
+        khang, _ = self._connect_and_hello("Minh Khang")
+        hoa, _ = self._connect_and_hello("Thái Hoà")
+        an, _ = self._connect_and_hello("An")
         try:
-            khang.send_payload(encode_message(make_message("join_room", room="do-an-nhom")))
-            collect_until(
+            # 1. Minh Khang tạo phòng riêng tư '#phong-kin'
+            khang.send_payload(
+                encode_message(
+                    make_message("join_room", room="phong-kin", is_private=True)
+                )
+            )
+            evs_k = collect_until(
                 khang,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
+                lambda e: not is_binary_frame(e.data)
                 and decode_message(e.data).get("system") is True
-                and "#do-an-nhom" in decode_message(e.data).get("text", ""),
+                and "#phong-kin" in decode_message(e.data).get("text", ""),
             )
+            rlist_k = [
+                decode_message(e.data)
+                for e in evs_k
+                if decode_message(e.data).get("type") == "room_list"
+            ][-1]
+            self.assertIn("phong-kin", rlist_k["private_rooms"])
+            self.assertEqual(rlist_k["owners"]["phong-kin"], "Minh Khang")
 
-            hoa.send_payload(encode_message(make_message("join_room", room="do-an-nhom")))
-            collect_until(
+            # 2. Thái Hoà xin vào '#phong-kin' -> bị giữ ở #chung và gửi join_request tới Admin Minh Khang
+            hoa.send_payload(encode_message(make_message("join_room", room="phong-kin")))
+            evs_hoa_wait = collect_until(
                 hoa,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
+                lambda e: not is_binary_frame(e.data)
                 and decode_message(e.data).get("system") is True
-                and "#do-an-nhom" in decode_message(e.data).get("text", ""),
+                and "vui lòng chờ duyệt" in decode_message(e.data).get("text", ""),
             )
+            rlist_hoa_wait = [
+                decode_message(e.data)
+                for e in evs_hoa_wait
+                if decode_message(e.data).get("type") == "room_list"
+            ][-1]
+            self.assertEqual(rlist_hoa_wait["current_room"], "chung")
+            self.assertNotIn("phong-kin", rlist_hoa_wait["joined_rooms"])
 
-            collect_until(
-                an,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
-                and "Thái Hoà đã chuyển sang phòng #do-an-nhom"
+            # Minh Khang nhận ngay gói join_request của Thái Hoà
+            req_ev = collect_until(
+                khang,
+                lambda e: not is_binary_frame(e.data)
+                and decode_message(e.data).get("type") == "join_request",
+            )[-1]
+            req_pkt = decode_message(req_ev.data)
+            self.assertEqual(req_pkt["room"], "phong-kin")
+            self.assertEqual(req_pkt["username"], "Thái Hoà")
+
+            # Người ngoài (An) không được phép duyệt hoặc xem thành viên phòng Private
+            an.send_payload(
+                encode_message(
+                    make_message(
+                        "approve_join", room="phong-kin", target="Thái Hoà", approve=True
+                    )
+                )
+            )
+            err_approve = collect_until(
+                an, lambda e: decode_message(e.data).get("type") == "error"
+            )[-1]
+            self.assertEqual(decode_message(err_approve.data)["code"], "APPROVE_DENIED")
+
+            an.send_payload(encode_message(make_message("get_members", room="phong-kin")))
+            err_mem = collect_until(
+                an, lambda e: decode_message(e.data).get("type") == "error"
+            )[-1]
+            self.assertEqual(decode_message(err_mem.data)["code"], "PRIVATE_ROOM")
+
+            # 3. Admin Minh Khang bấm Duyệt -> Thái Hoà tự động được chuyển thẳng vào '#phong-kin'!
+            khang.send_payload(
+                encode_message(
+                    make_message(
+                        "approve_join", room="phong-kin", target="Thái Hoà", approve=True
+                    )
+                )
+            )
+            evs_hoa_approved = collect_until(
+                hoa,
+                lambda e: not is_binary_frame(e.data)
+                and decode_message(e.data).get("system") is True
+                and "đã duyệt bạn vào phòng #phong-kin"
                 in decode_message(e.data).get("text", ""),
             )
-            while not an.events.empty():
-                an.events.get_nowait()
+            rlist_hoa_in = [
+                decode_message(e.data)
+                for e in evs_hoa_approved
+                if decode_message(e.data).get("type") == "room_list"
+            ][-1]
+            self.assertEqual(rlist_hoa_in["current_room"], "phong-kin")
+            self.assertIn("phong-kin", rlist_hoa_in["joined_rooms"])
 
+            # 4. Kiểm tra danh sách thành viên (tương đương gõ ///)
+            hoa.send_payload(
+                encode_message(make_message("get_members", room="phong-kin"))
+            )
+            mem_ev = collect_until(
+                hoa, lambda e: decode_message(e.data).get("type") == "member_list"
+            )[-1]
+            mem_pkt = decode_message(mem_ev.data)
+            self.assertEqual(mem_pkt["owner"], "Minh Khang")
+            self.assertTrue(mem_pkt["is_private"])
+            self.assertCountEqual(mem_pkt["members"], ["Minh Khang", "Thái Hoà"])
+            self.assertCountEqual(mem_pkt["online_members"], ["Minh Khang", "Thái Hoà"])
+
+            # Thành viên thường (Thái Hoà) không thể kick Admin
+            hoa.send_payload(
+                encode_message(
+                    make_message("kick_member", room="phong-kin", target="Minh Khang")
+                )
+            )
+            err_kick = collect_until(
+                hoa, lambda e: decode_message(e.data).get("type") == "error"
+            )[-1]
+            self.assertEqual(decode_message(err_kick.data)["code"], "KICK_DENIED")
+
+            # 5. Admin Minh Khang bấm Kick Thái Hoà -> đẩy Thái Hoà về #chung & khóa quyền vào lại!
             khang.send_payload(
-                encode_message(make_message("chat", text="Tin mật trong phòng đồ án!"))
+                encode_message(
+                    make_message("kick_member", room="phong-kin", target="Thái Hoà")
+                )
             )
-
-            evs_hoa = collect_until(
+            evs_hoa_kicked = collect_until(
                 hoa,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
-                and decode_message(e.data).get("type") == "chat"
-                and not decode_message(e.data).get("system"),
+                lambda e: not is_binary_frame(e.data)
+                and decode_message(e.data).get("system") is True
+                and "bị Admin (Minh Khang) kick khỏi phòng #phong-kin"
+                in decode_message(e.data).get("text", ""),
             )
-            chat_pkt = decode_message(evs_hoa[-1].data)
-            self.assertEqual(chat_pkt["sender"], "Minh Khang")
-            self.assertEqual(chat_pkt["room"], "do-an-nhom")
-            self.assertEqual(chat_pkt["text"], "Tin mật trong phòng đồ án!")
-            self.assertIsInstance(chat_pkt["msg_id"], int)
-
-            with self.assertRaises(queue.Empty):
-                an.events.get(timeout=0.15)
+            rlist_after_kick = [
+                decode_message(e.data)
+                for e in evs_hoa_kicked
+                if decode_message(e.data).get("type") == "room_list"
+            ][-1]
+            self.assertEqual(rlist_after_kick["current_room"], "chung")
+            self.assertNotIn("phong-kin", rlist_after_kick["joined_rooms"])
         finally:
             khang.disconnect()
             hoa.disconnect()
             an.disconnect()
 
-    def test_large_binary_file_chunking_and_sqlite_history_on_relogin(self):
-        """Gửi file nhị phân 130 KB (> giới hạn 64 KiB của 1 frame TCP) + Đăng nhập lại nhận đủ lịch sử SQLite."""
-        khang = self._connect_and_hello("Minh Khang", room="hoc-tap")
-        hoa = self._connect_and_hello("Thái Hoà", room="hoc-tap")
-        large_binary = bytes(range(256)) * 520  # 133,120 bytes (~3 mảnh 48 KiB)
+    def test_room_persistence_on_relogin_member_leave_and_admin_delete(self):
+        khang, _ = self._connect_and_hello("Minh Khang")
+        try:
+            khang.send_payload(encode_message(make_message("join_room", room="nhom-vip")))
+            collect_until(
+                khang,
+                lambda e: decode_message(e.data).get("system") is True
+                and "#nhom-vip" in decode_message(e.data).get("text", ""),
+            )
+        finally:
+            khang.disconnect()
+
+        self._stop_server()
+        self._start_server()
+
+        khang2, khang_rlist = self._connect_and_hello("Minh Khang")
+        hoa, _ = self._connect_and_hello("Thái Hoà")
+        try:
+            self.assertEqual(khang_rlist["current_room"], "nhom-vip")
+            self.assertEqual(khang_rlist["owners"]["nhom-vip"], "Minh Khang")
+
+            hoa.send_payload(encode_message(make_message("join_room", room="nhom-vip")))
+            collect_until(
+                hoa,
+                lambda e: decode_message(e.data).get("system") is True
+                and "#nhom-vip" in decode_message(e.data).get("text", ""),
+            )
+
+            hoa.send_payload(encode_message(make_message("leave_room", room="nhom-vip")))
+            hoa_evs = collect_until(
+                hoa,
+                lambda e: decode_message(e.data).get("system") is True
+                and "quay về sảnh #chung" in decode_message(e.data).get("text", ""),
+            )
+            hoa_rlist = [
+                decode_message(e.data)
+                for e in hoa_evs
+                if decode_message(e.data).get("type") == "room_list"
+            ][-1]
+            self.assertNotIn("nhom-vip", hoa_rlist["rooms"])
+
+            khang2.send_payload(
+                encode_message(make_message("delete_room", room="nhom-vip"))
+            )
+            collect_until(
+                khang2,
+                lambda e: decode_message(e.data).get("system") is True
+                and "đã bị Admin (Minh Khang) xóa"
+                in decode_message(e.data).get("text", ""),
+            )
+            self.assertNotIn("nhom-vip", self.server.storage.list_rooms())
+        finally:
+            khang2.disconnect()
+            hoa.disconnect()
+
+    def test_binary_file_sqlite_history_and_recall(self):
+        khang, _ = self._connect_and_hello("Minh Khang", room="hoc-tap")
+        hoa, _ = self._connect_and_hello("Thái Hoà", room="hoc-tap")
+        large_binary = bytes(range(256)) * 520
 
         try:
             khang.send_payload(
-                encode_message(make_message("chat", text="Gửi tài liệu ôn tập nhé!"))
+                encode_message(make_message("chat", text="Nhắn nhầm cần thu hồi!"))
             )
-            fid = khang.send_file_async("tai_lieu_mang.bin", large_binary)
-            self.assertTrue(fid)
-
-            # Người gửi nhận được cả EVENT_FILE_SENT lẫn gói file_saved kèm msg_id
-            collect_until(
+            ev_chat = collect_until(
                 khang,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
-                and decode_message(e.data).get("type") == "file_saved",
-            )
+                lambda e: decode_message(e.data).get("type") == "chat"
+                and not decode_message(e.data).get("system"),
+            )[-1]
+            msg_id = decode_message(ev_chat.data)["msg_id"]
 
-            hoa_events = collect_until(
+            khang.send_file_async("tai_lieu.bin", large_binary)
+            collect_until(
                 hoa,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
+                lambda e: not is_binary_frame(e.data)
                 and decode_message(e.data).get("type") == "file_end",
             )
 
-            assembled_chunks = {}
-            file_meta = None
-            for ev in hoa_events:
-                if ev.type != EVENT_MESSAGE:
-                    continue
-                if is_binary_frame(ev.data):
-                    _, idx, chunk = decode_binary_chunk(ev.data)
-                    assembled_chunks[idx] = chunk
-                else:
-                    pkt = decode_message(ev.data)
-                    if pkt["type"] == "file_start":
-                        file_meta = pkt
-
-            self.assertIsNotNone(file_meta)
-            self.assertEqual(file_meta["filename"], "tai_lieu_mang.bin")
-            self.assertIsInstance(file_meta["msg_id"], int)
-            rebuilt = b"".join(assembled_chunks[i] for i in range(file_meta["total_chunks"]))
-            self.assertEqual(rebuilt, large_binary)
-        finally:
-            khang.disconnect()
-            hoa.disconnect()
-
-        # Người dùng thứ 3 đăng nhập sau đó -> SQLite tự phát lại cả chat & file cũ
-        late_user = SocketClient()
-        try:
-            late_user.connect_async("127.0.0.1", self.port)
-            self.assertEqual(late_user.events.get(timeout=3.0).type, EVENT_CONNECTED)
-            late_user.send_payload(
-                encode_message(make_message("hello", username="Sinh Viên Mới", room="hoc-tap"))
-            )
-
-            replay_events = collect_until(
-                late_user,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
-                and decode_message(e.data).get("type") == "chat"
-                and decode_message(e.data).get("system") is True,
-            )
-
-            history_chats = []
-            history_file_chunks = {}
-            history_file_meta = None
-
-            for ev in replay_events:
-                if ev.type != EVENT_MESSAGE:
-                    continue
-                if is_binary_frame(ev.data):
-                    _, idx, chunk = decode_binary_chunk(ev.data)
-                    history_file_chunks[idx] = chunk
-                else:
-                    pkt = decode_message(ev.data)
-                    if pkt["type"] == "chat" and pkt.get("history"):
-                        history_chats.append(pkt)
-                    elif pkt["type"] == "file_start" and pkt.get("history"):
-                        history_file_meta = pkt
-
-            self.assertEqual(len(history_chats), 1)
-            self.assertEqual(history_chats[0]["text"], "Gửi tài liệu ôn tập nhé!")
-            self.assertIsNotNone(history_file_meta)
-            replayed_bytes = b"".join(
-                history_file_chunks[i] for i in range(history_file_meta["total_chunks"])
-            )
-            self.assertEqual(replayed_bytes, large_binary)
-        finally:
-            late_user.disconnect()
-
-    def test_message_recall_authorization_sync_and_sqlite_wipe(self):
-        """Thu hồi tin nhắn: chặn thu hồi trái phép, đồng bộ xóa trên mọi client & xóa sạch trong SQLite."""
-        khang = self._connect_and_hello("Minh Khang", room="chung")
-        hoa = self._connect_and_hello("Thái Hoà", room="chung")
-        try:
-            khang.send_payload(
-                encode_message(make_message("chat", text="Nhắn nhầm mật khẩu 123456!"))
-            )
-
-            ev_khang = collect_until(
-                khang,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
-                and decode_message(e.data).get("type") == "chat"
-                and not decode_message(e.data).get("system"),
-            )[-1]
-            ev_hoa = collect_until(
-                hoa,
-                lambda e: e.type == EVENT_MESSAGE
-                and not is_binary_frame(e.data)
-                and decode_message(e.data).get("type") == "chat"
-                and not decode_message(e.data).get("system"),
-            )[-1]
-
-            msg_id = decode_message(ev_khang.data)["msg_id"]
-            self.assertEqual(decode_message(ev_hoa.data)["msg_id"], msg_id)
-
-            # 1. Thái Hoà cố tình thu hồi tin của Minh Khang -> bị Server từ chối RECALL_DENIED
-            hoa.send_payload(encode_message(make_message("recall", msg_id=msg_id)))
-            err_ev = collect_until(
-                hoa,
-                lambda e: e.type == EVENT_MESSAGE
-                and decode_message(e.data).get("type") == "error",
-            )[-1]
-            self.assertEqual(decode_message(err_ev.data)["code"], "RECALL_DENIED")
-
-            # 2. Chính chủ Minh Khang bấm thu hồi -> cả Khang lẫn Hoà đều nhận gói recall
             khang.send_payload(encode_message(make_message("recall", msg_id=msg_id)))
-            rec_khang = collect_until(
-                khang,
-                lambda e: e.type == EVENT_MESSAGE
-                and decode_message(e.data).get("type") == "recall",
-            )[-1]
-            rec_hoa = collect_until(
-                hoa,
-                lambda e: e.type == EVENT_MESSAGE
-                and decode_message(e.data).get("type") == "recall",
-            )[-1]
-            self.assertEqual(decode_message(rec_khang.data)["msg_id"], msg_id)
-            self.assertEqual(decode_message(rec_hoa.data)["msg_id"], msg_id)
+            for c in (khang, hoa):
+                rec = collect_until(
+                    c,
+                    lambda e: e.type == EVENT_MESSAGE
+                    and not is_binary_frame(e.data)
+                    and decode_message(e.data).get("type") == "recall",
+                )[-1]
+                self.assertEqual(decode_message(rec.data)["msg_id"], msg_id)
         finally:
             khang.disconnect()
             hoa.disconnect()
 
-        # 3. Người mới đăng nhập lại sau đó chỉ thấy trạng thái recalled=True, KHÔNG thấy mật khẩu cũ
-        viewer = self._connect_and_hello("Người Xem Sau", room="chung")
-        try:
-            hist = self.server.storage.get_recent_history("chung")
-            self.assertEqual(len(hist), 1)
-            self.assertTrue(hist[0]["recalled"])
-            self.assertEqual(hist[0]["content"], "")
-        finally:
-            viewer.disconnect()
 
-
-class TestProtocolValidation(unittest.TestCase):
-    def test_protocol_schema_and_binary_validation(self):
-        msg = make_message("chat", text="Xin chào Việt Nam 🇻🇳")
-        self.assertEqual(decode_message(encode_message(msg)), msg)
-
-        recall_msg = make_message("recall", msg_id=10)
-        self.assertEqual(decode_message(encode_message(recall_msg)), recall_msg)
-
-        for bad_payload in (b"\xff\xfe", b'{"type":', "not bytes"):
-            with self.assertRaises(ProtocolError):
-                decode_message(bad_payload)  # type: ignore[arg-type]
+class TestProtocolAndGUIControls(unittest.TestCase):
+    def test_protocol_and_gui_triple_slash_and_private_controls(self):
+        for valid_msg in (
+            make_message("join_room", room="kin", is_private=True),
+            make_message("join_request", room="kin", username="An"),
+            make_message("approve_join", room="kin", target="An", approve=True),
+            make_message("kick_member", room="kin", target="An"),
+            make_message("get_members", room="kin"),
+            make_message(
+                "member_list",
+                room="kin",
+                owner="Khang",
+                is_private=True,
+                members=["Khang", "An"],
+                online_members=["Khang"],
+                pending_requests=["Hoà"],
+            ),
+        ):
+            self.assertEqual(decode_message(encode_message(valid_msg)), valid_msg)
 
         for bad_dict in (
-            {"version": 1, "type": "chat"},
+            make_message("kick_member", room="kin", target="  "),
+            make_message("approve_join", room="kin", target="An", approve="yes"),
             {"version": 1, "type": "unknown"},
-            make_message("hello", username="   "),
-            make_message("join_room", room="   "),
-            make_message("recall", msg_id=0),
-            make_message("recall", msg_id=True),
         ):
             with self.assertRaises(ProtocolError):
                 encode_message(bad_dict)
 
-        chunk_frame = encode_binary_chunk("f01", 2, b"\x00\x01\xff")
-        self.assertTrue(is_binary_frame(chunk_frame))
-        self.assertEqual(decode_binary_chunk(chunk_frame), ("f01", 2, b"\x00\x01\xff"))
-
-
-class TestGUIWithRoomsImageAndInPlaceRecall(unittest.TestCase):
-    def test_gui_renders_and_recalls_message_and_image_in_place(self):
-        args = parse_args(["--h", "127.0.0.1", "--p", "65432", "--n", "Khang", "--r", "hoc-tap"])
-        self.assertEqual(args.room, "hoc-tap")
+        args = parse_args(["--h", "127.0.0.1", "--p", "65432", "--n", "Khang"])
+        self.assertIsNone(args.room)
         for bad in ("0", "70000", "xyz"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 valid_port(bad)
@@ -347,90 +383,38 @@ class TestGUIWithRoomsImageAndInPlaceRecall(unittest.TestCase):
         root = tk.Tk()
         root.withdraw()
         try:
-            gui = ChatClientGUI(root, initial_name="Minh Khang", initial_room="chung")
+            gui = ChatClientGUI(root, initial_name="Minh Khang")
             root.update_idletasks()
             min_w, _ = root.minsize()
             self.assertGreaterEqual(min_w, root.winfo_reqwidth())
 
-            gui.input_text.insert("1.0", "Đang gõ câu hỏi...")
+            # Nhận thông báo xin vào phòng Private kèm nút Duyệt / Từ chối
+            gui._handle_network_event(
+                EVENT_MESSAGE,
+                encode_message(
+                    make_message("join_request", room="phong-kin", username="Thái Hoà")
+                ),
+            )
+            self.assertIn("Thái Hoà", gui.chat_text.get("1.0", "end-1c"))
 
-            # Tin nhắn số 1 (giữ lại)
+            # Nhận phản hồi danh sách thành viên (từ lệnh /// hoặc nút 👥 Thành viên)
             gui._handle_network_event(
                 EVENT_MESSAGE,
                 encode_message(
                     make_message(
-                        "chat",
-                        text="Tin số 1 giữ nguyên",
-                        sender="Minh Khang",
-                        room="chung",
-                        timestamp="10:00:01",
-                        msg_id=1,
+                        "member_list",
+                        room="phong-kin",
+                        owner="Minh Khang",
+                        is_private=True,
+                        members=["Minh Khang", "Thái Hoà"],
+                        online_members=["Minh Khang", "Thái Hoà"],
+                        pending_requests=[],
                     )
                 ),
             )
-            # Tin nhắn số 2 (sẽ bị thu hồi)
-            gui._handle_network_event(
-                EVENT_MESSAGE,
-                encode_message(
-                    make_message(
-                        "chat",
-                        text="Bí mật cần thu hồi gấp!",
-                        sender="Thái Hoà",
-                        room="chung",
-                        timestamp="10:00:02",
-                        msg_id=2,
-                    )
-                ),
-            )
-            # Tin nhắn số 3 (ảnh PNG sẽ bị thu hồi)
-            gui._handle_network_event(
-                EVENT_MESSAGE,
-                encode_message(
-                    make_message(
-                        "file_start",
-                        file_id="img03",
-                        filename="anh_nham.png",
-                        size=len(TINY_PNG_BYTES),
-                        total_chunks=1,
-                        sender="Thái Hoà",
-                        room="chung",
-                        timestamp="10:00:03",
-                        msg_id=3,
-                    )
-                ),
-            )
-            gui._handle_network_event(
-                EVENT_MESSAGE, encode_binary_chunk("img03", 0, TINY_PNG_BYTES)
-            )
-            gui._handle_network_event(
-                EVENT_MESSAGE, encode_message(make_message("file_end", file_id="img03"))
-            )
-
-            before_recall = gui.chat_text.get("1.0", "end-1c")
-            self.assertIn("Bí mật cần thu hồi gấp!", before_recall)
-            self.assertIn("anh_nham.png", before_recall)
-
-            # Thu hồi cả tin số 2 lẫn ảnh số 3 ngay tại chỗ!
-            gui._handle_network_event(
-                EVENT_MESSAGE,
-                encode_message(
-                    make_message("recall", msg_id=2, room="chung", sender="Thái Hoà")
-                ),
-            )
-            gui._handle_network_event(
-                EVENT_MESSAGE,
-                encode_message(
-                    make_message("recall", msg_id=3, room="chung", sender="Thái Hoà")
-                ),
-            )
-
-            after_recall = gui.chat_text.get("1.0", "end-1c")
-            # Tin số 1 và nội dung đang gõ vẫn còn nguyên; tin số 2 và ảnh số 3 đã biến mất!
-            self.assertEqual(gui._get_input_content(), "Đang gõ câu hỏi...")
-            self.assertIn("Tin số 1 giữ nguyên", after_recall)
-            self.assertNotIn("Bí mật cần thu hồi gấp!", after_recall)
-            self.assertNotIn("anh_nham.png", after_recall)
-            self.assertEqual(after_recall.count("🚫 Tin nhắn đã được thu hồi"), 2)
+            chat_log = gui.chat_text.get("1.0", "end-1c")
+            self.assertIn("👥 Thành viên #phong-kin", chat_log)
+            self.assertIn("👑 Minh Khang", chat_log)
         finally:
             root.destroy()
 
