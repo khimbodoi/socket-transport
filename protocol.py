@@ -16,6 +16,8 @@ ALLOWED_TYPES = {
     "room_list",
     "file_start",
     "file_end",
+    "file_saved",
+    "recall",
 }
 
 # Frame nhị phân truyền dữ liệu file/ảnh trực tiếp bằng bytes (bắt đầu bằng 0x89, không bao giờ trùng '{' của JSON)
@@ -62,16 +64,20 @@ def _validate_message(message) -> None:
         "room_list": {"rooms", "current_room"},
         "file_start": {"file_id", "filename", "size", "total_chunks"},
         "file_end": {"file_id"},
+        "file_saved": {"file_id", "msg_id"},
+        "recall": {"msg_id"},
     }
     optional_by_type = {
         "hello": {"room"},
-        "chat": {"sender", "room", "timestamp", "system", "history"},
+        "chat": {"sender", "room", "timestamp", "system", "history", "msg_id", "recalled"},
         "bye": set(),
         "error": set(),
         "join_room": set(),
         "room_list": set(),
-        "file_start": {"sender", "room", "timestamp", "history"},
+        "file_start": {"sender", "room", "timestamp", "history", "msg_id"},
         "file_end": set(),
+        "file_saved": {"room", "timestamp"},
+        "recall": {"sender", "room", "timestamp"},
     }
 
     allowed = common | required_by_type[msg_type] | optional_by_type[msg_type]
@@ -98,9 +104,14 @@ def _validate_message(message) -> None:
         if not isinstance(message[field], str):
             raise ProtocolError(f"{field} phải là chuỗi")
 
-    for bool_field in {"system", "history"} & message.keys():
+    for bool_field in {"system", "history", "recalled"} & message.keys():
         if not isinstance(message[bool_field], bool):
             raise ProtocolError(f"{bool_field} phải là kiểu bool")
+
+    if "msg_id" in message:
+        mid = message["msg_id"]
+        if isinstance(mid, bool) or not isinstance(mid, int) or mid <= 0:
+            raise ProtocolError("msg_id phải là số nguyên dương")
 
     if msg_type == "hello" and not message["username"].strip():
         raise ProtocolError("username không được để trống")
@@ -134,7 +145,7 @@ def _validate_message(message) -> None:
         ):
             raise ProtocolError("total_chunks phải là số nguyên không âm")
 
-    if msg_type == "file_end" and not message["file_id"].strip():
+    if msg_type in {"file_end", "file_saved"} and not message["file_id"].strip():
         raise ProtocolError("file_id không được để trống")
 
 
@@ -187,11 +198,7 @@ def is_binary_frame(payload: bytes) -> bool:
 
 
 def encode_binary_chunk(file_id: str, chunk_index: int, data: bytes) -> bytes:
-    """Đóng gói một mảnh dữ liệu nhị phân (bytes) để truyền thẳng qua send_msg().
-
-    Định dạng gói nhị phân:
-        [4B BINARY_MAGIC] + [1B độ dài file_id] + [file_id ASCII/UTF-8] + [4B chunk_index big-endian] + [raw bytes]
-    """
+    """Đóng gói một mảnh dữ liệu nhị phân (bytes) để truyền thẳng qua send_msg()."""
     if not isinstance(data, (bytes, bytearray)):
         raise ProtocolError("Dữ liệu chunk phải có kiểu bytes")
     fid_bytes = file_id.strip().encode("utf-8")

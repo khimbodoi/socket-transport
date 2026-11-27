@@ -226,8 +226,8 @@ class SocketClient:
                 )
             return False
 
-    def send_file_async(self, filename: str, file_bytes: bytes) -> None:
-        """Truyền file/hình ảnh bằng các frame nhị phân (bytes) trên luồng phụ."""
+    def send_file_async(self, filename: str, file_bytes: bytes) -> str:
+        """Truyền file/hình ảnh bằng các frame nhị phân (bytes) trên luồng phụ. Trả về `file_id`."""
         clean_name = os.path.basename(filename.strip()) or "tep_dinh_kem.bin"
         raw = bytes(file_bytes)
         if len(raw) > MAX_FILE_SIZE:
@@ -238,16 +238,17 @@ class SocketClient:
         if not self.is_connected:
             raise ConnectionError("Chưa có kết nối tới server")
 
+        file_id = uuid.uuid4().hex[:12]
         worker = threading.Thread(
             target=self._file_send_worker,
-            args=(clean_name, raw),
+            args=(file_id, clean_name, raw),
             name="tcp-file-send-worker",
             daemon=True,
         )
         worker.start()
+        return file_id
 
-    def _file_send_worker(self, filename: str, raw: bytes) -> None:
-        file_id = uuid.uuid4().hex[:12]
+    def _file_send_worker(self, file_id: str, filename: str, raw: bytes) -> None:
         chunks = [
             raw[idx : idx + FILE_CHUNK_SIZE]
             for idx in range(0, len(raw), FILE_CHUNK_SIZE)
@@ -277,7 +278,7 @@ class SocketClient:
             self.events.put(
                 NetworkEvent(
                     EVENT_FILE_SENT,
-                    {"filename": filename, "data": raw},
+                    {"file_id": file_id, "filename": filename, "data": raw},
                 )
             )
         except Exception as err:

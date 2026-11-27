@@ -1,16 +1,16 @@
-"""Tầng lưu trữ lịch sử phòng chat & file bằng SQLite (thư viện chuẩn sqlite3).
+"""Tầng lưu trữ lịch sử phòng chat, file & trạng thái thu hồi bằng SQLite (sqlite3).
 
 Lưu bền vững vào file `chat_history.db`:
 - Bảng `rooms`: Lưu danh sách các phòng chat theo chủ đề.
-- Bảng `messages`: Lưu tin nhắn văn bản và cả dữ liệu nhị phân (BLOB) của file/hình ảnh đã gửi,
-  giúp người dùng đăng nhập lại hoặc chuyển phòng vẫn xem và tải lại được tin nhắn/ảnh cũ.
+- Bảng `messages`: Lưu tin nhắn văn bản, dữ liệu nhị phân (BLOB) của file/hình ảnh,
+  và cột `recalled` để đánh dấu xóa/thu hồi nội dung trên mọi phiên đăng nhập sau.
 """
 
 from datetime import datetime
 import os
 import sqlite3
 import threading
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from protocol import normalize_room_name
 
@@ -58,10 +58,19 @@ class ChatStorage:
                     msg_type TEXT NOT NULL,
                     content TEXT NOT NULL,
                     file_data BLOB,
+                    recalled INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
                 """
             )
+            # Tự động nâng cấp nếu file chat_history.db cũ chưa có cột recalled
+            try:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_room_id
@@ -93,7 +102,6 @@ class ChatStorage:
         return norm
 
     def list_rooms(self) -> List[str]:
-        """Trả về danh sách các phòng theo thứ tự tạo."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT name FROM rooms ORDER BY id ASC;"
@@ -112,8 +120,8 @@ class ChatStorage:
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO messages(room, sender, msg_type, content, file_data, created_at)
-                VALUES (?, ?, 'chat', ?, NULL, ?);
+                INSERT INTO messages(room, sender, msg_type, content, file_data, recalled, created_at)
+                VALUES (?, ?, 'chat', ?, NULL, 0, ?);
                 """,
                 (norm_room, sender, text, ts),
             )
@@ -133,13 +141,51 @@ class ChatStorage:
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO messages(room, sender, msg_type, content, file_data, created_at)
-                VALUES (?, ?, 'file', ?, ?, ?);
+                INSERT INTO messages(room, sender, msg_type, content, file_data, recalled, created_at)
+                VALUES (?, ?, 'file', ?, ?, 0, ?);
                 """,
                 (norm_room, sender, filename, sqlite3.Binary(file_bytes), ts),
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)
+
+    def recall_message(
+        self, msg_id: int, requester: str
+    ) -> Tuple[bool, str, Optional[Dict[str, object]]]:
+        """Thu hồi tin nhắn hoặc tệp theo `msg_id` (chỉ chính chủ mới được phép thu hồi).
+
+        Xóa sạch nội dung gốc và dữ liệu BLOB trong SQLite, đồng thời bật cờ `recalled = 1`.
+        Trả về `(thành_công, thông_báo_lỗi_nếu_có, thông_tin_bản_ghi)`.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, room, sender, recalled, created_at FROM messages WHERE id = ?;",
+                (msg_id,),
+            ).fetchone()
+            if row is None:
+                return False, "Không tìm thấy tin nhắn cần thu hồi.", None
+            if str(row["sender"]) != requester:
+                return False, "Bạn chỉ có thể thu hồi tin nhắn do chính mình gửi.", None
+            if int(row["recalled"]) == 1:
+                return False, "Tin nhắn này đã được thu hồi trước đó.", None
+
+            self._conn.execute(
+                """
+                UPDATE messages
+                SET recalled = 1, content = '', file_data = NULL
+                WHERE id = ?;
+                """,
+                (msg_id,),
+            )
+            self._conn.commit()
+
+            info: Dict[str, object] = {
+                "msg_id": int(row["id"]),
+                "room": str(row["room"]),
+                "sender": str(row["sender"]),
+                "timestamp": str(row["created_at"]),
+            }
+            return True, "", info
 
     def get_recent_history(self, room: str, limit: int = 40) -> List[Dict[str, object]]:
         """Lấy `limit` tin nhắn/file gần nhất của phòng theo thứ tự thời gian cũ -> mới."""
@@ -147,7 +193,7 @@ class ChatStorage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, room, sender, msg_type, content, file_data, created_at
+                SELECT id, room, sender, msg_type, content, file_data, recalled, created_at
                 FROM messages
                 WHERE room = ?
                 ORDER BY id DESC
@@ -165,7 +211,10 @@ class ChatStorage:
                     "sender": str(row["sender"]),
                     "msg_type": str(row["msg_type"]),
                     "content": str(row["content"]),
-                    "file_data": bytes(row["file_data"]) if row["file_data"] is not None else None,
+                    "file_data": (
+                        bytes(row["file_data"]) if row["file_data"] is not None else None
+                    ),
+                    "recalled": bool(row["recalled"]),
                     "timestamp": str(row["created_at"]),
                 }
             )
