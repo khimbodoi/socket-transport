@@ -1,9 +1,9 @@
-"""Server Chat đa luồng: Chia phòng (Channels) + Truyền File/Ảnh nhị phân + Lưu lịch sử SQLite.
+"""Server Chat đa luồng: Chia phòng + Truyền File/Ảnh nhị phân + Lưu lịch sử SQLite + Thu hồi tin nhắn.
 
 Tích hợp đầy đủ:
 - Tầng framing TCP (`transport.py`): 4-byte header big-endian + N-byte payload (<= 64 KiB/frame).
 - Tầng giao thức (`protocol.py`): Gói điều khiển JSON UTF-8 + Gói dữ liệu nhị phân (`BINARY_MAGIC`).
-- Tầng lưu trữ (`storage.py`): SQLite `chat_history.db` lưu danh sách phòng, lịch sử chat và file/ảnh.
+- Tầng lưu trữ (`storage.py`): SQLite `chat_history.db` lưu phòng, lịch sử chat/file và trạng thái thu hồi.
 
 Chạy server:
     py chat_server.py
@@ -74,7 +74,7 @@ class ClientSession:
 
 
 class ChatRoomServer:
-    """TCP Chat Server hỗ trợ nhiều phòng chat, gửi file nhị phân và lưu lịch sử SQLite."""
+    """TCP Chat Server hỗ trợ nhiều phòng chat, gửi file nhị phân, lưu lịch sử SQLite & thu hồi tin nhắn."""
 
     def __init__(
         self,
@@ -207,6 +207,7 @@ class ChatRoomServer:
         sender: str,
         room: str,
         timestamp: str,
+        msg_id: int,
         is_history: bool = False,
     ) -> int:
         if not targets:
@@ -228,6 +229,7 @@ class ChatRoomServer:
                 room=room,
                 timestamp=timestamp,
                 history=is_history,
+                msg_id=msg_id,
             )
         )
         chunk_frames = [
@@ -296,10 +298,25 @@ class ChatRoomServer:
                 ),
             )
 
-        # Nạp lịch sử tin nhắn & file từ SQLite cho người vừa vào phòng
+        # Nạp lịch sử tin nhắn, file & trạng thái thu hồi từ SQLite cho người vừa vào phòng
         history = self.storage.get_recent_history(target_room, limit=HISTORY_REPLAY_LIMIT)
         for item in history:
-            if item["msg_type"] == "chat":
+            mid = int(item["id"])
+            if item.get("recalled"):
+                self._send_to(
+                    session,
+                    make_message(
+                        "chat",
+                        text="",
+                        sender=str(item["sender"]),
+                        room=target_room,
+                        timestamp=str(item["timestamp"]),
+                        history=True,
+                        msg_id=mid,
+                        recalled=True,
+                    ),
+                )
+            elif item["msg_type"] == "chat":
                 self._send_to(
                     session,
                     make_message(
@@ -309,6 +326,7 @@ class ChatRoomServer:
                         room=target_room,
                         timestamp=str(item["timestamp"]),
                         history=True,
+                        msg_id=mid,
                     ),
                 )
             elif item["msg_type"] == "file" and isinstance(item["file_data"], bytes):
@@ -319,6 +337,7 @@ class ChatRoomServer:
                     sender=str(item["sender"]),
                     room=target_room,
                     timestamp=str(item["timestamp"]),
+                    msg_id=mid,
                     is_history=True,
                 )
 
@@ -418,13 +437,25 @@ class ChatRoomServer:
             return
 
         ts = now_hhmmss()
-        self.storage.save_file(
+        msg_id = self.storage.save_file(
             room=transfer.room,
             sender=session.username,
             filename=transfer.filename,
             file_bytes=assembled,
             timestamp=ts,
         )
+        # Xác nhận mã msg_id về cho chính người gửi (không cần tải ngược lại toàn bộ dữ liệu nhị phân)
+        self._send_to(
+            session,
+            make_message(
+                "file_saved",
+                file_id=transfer.file_id,
+                msg_id=msg_id,
+                room=transfer.room,
+                timestamp=ts,
+            ),
+        )
+        # Chuyển tiếp các mảnh nhị phân kèm msg_id tới các thành viên khác trong cùng phòng
         peers = self._room_sessions(transfer.room, exclude_sock=session.sock)
         sent_count = self._stream_file_to_sessions(
             targets=peers,
@@ -433,11 +464,12 @@ class ChatRoomServer:
             sender=session.username,
             room=transfer.room,
             timestamp=ts,
+            msg_id=msg_id,
             is_history=False,
         )
         self._log(
-            f"[FILE SAVED] '{transfer.filename}' ({len(assembled):,}B) tại #{transfer.room} "
-            f"-> lưu SQLite & gửi tới {sent_count} thành viên"
+            f"[FILE SAVED #{msg_id}] '{transfer.filename}' ({len(assembled):,}B) tại #{transfer.room} "
+            f"-> lưu SQLite & gửi tới {sent_count} thành viên khác"
         )
 
     def _handle_client(self, session: ClientSession) -> None:
@@ -498,9 +530,10 @@ class ChatRoomServer:
                     content = msg["text"]
                     ts = now_hhmmss()
                     room = session.room
-                    self.storage.save_chat(
+                    msg_id = self.storage.save_chat(
                         room=room, sender=session.username, text=content, timestamp=ts
                     )
+                    # Gửi tới tất cả thành viên trong phòng (gồm cả người gửi để đồng bộ msg_id phục vụ thu hồi)
                     recipients = self._broadcast_room_json(
                         room,
                         make_message(
@@ -509,11 +542,12 @@ class ChatRoomServer:
                             sender=session.username,
                             room=room,
                             timestamp=ts,
+                            msg_id=msg_id,
                         ),
-                        exclude_sock=conn,
+                        exclude_sock=None,
                     )
                     self._log(
-                        f"[CHAT #{room}] {session.username} -> lưu SQLite & gửi {recipients} client khác"
+                        f"[CHAT #{room} id={msg_id}] {session.username} -> lưu SQLite & đồng bộ {recipients} client"
                     )
 
                 elif msg_type == "file_start":
@@ -532,6 +566,33 @@ class ChatRoomServer:
 
                 elif msg_type == "file_end":
                     self._finalize_incoming_file(session, msg["file_id"])
+
+                elif msg_type == "recall":
+                    target_id = msg["msg_id"]
+                    ok, err_msg, info = self.storage.recall_message(
+                        msg_id=target_id, requester=session.username
+                    )
+                    if not ok or info is None:
+                        self._send_to(
+                            session,
+                            make_message("error", code="RECALL_DENIED", message=err_msg),
+                        )
+                    else:
+                        target_room = str(info["room"])
+                        synced = self._broadcast_room_json(
+                            target_room,
+                            make_message(
+                                "recall",
+                                msg_id=int(info["msg_id"]),
+                                room=target_room,
+                                sender=str(info["sender"]),
+                                timestamp=str(info["timestamp"]),
+                            ),
+                            exclude_sock=None,
+                        )
+                        self._log(
+                            f"[RECALL #{target_room} id={target_id}] '{session.username}' thu hồi tin -> đồng bộ {synced} client"
+                        )
 
                 elif msg_type == "bye":
                     self._send_to(session, make_message("bye"))

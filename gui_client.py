@@ -1,9 +1,10 @@
 """Giao diện người dùng (GUI Client) cho Đồ án Socket TCP - Phần của Minh Khang.
 
-Đầy đủ 3 tính năng mở rộng trên nền `transport.py` + `protocol.py`:
-1. Chia phòng chat (Channels): Tạo phòng mới & chuyển phòng trực tiếp ở thanh bên trái (giống Discord/Slack).
-2. Gửi File / Hình ảnh nhị phân (bytes): Truyền mảnh nhị phân qua socket, hiển thị ảnh trực tiếp & nút tải về.
-3. Lịch sử tin nhắn SQLite: Tự động nạp lại tin nhắn và hình ảnh/file cũ của từng phòng khi đăng nhập lại.
+Đầy đủ 4 tính năng nâng cao trên nền `transport.py` + `protocol.py`:
+1. Chia phòng chat (Channels): Tạo phòng mới & chuyển phòng trực tiếp ở thanh bên trái.
+2. Gửi File / Hình ảnh nhị phân (bytes): Truyền mảnh nhị phân qua socket, xem trước ảnh trực tiếp & nút tải về.
+3. Lịch sử tin nhắn SQLite: Tự động nạp lại tin nhắn, hình ảnh/file cũ & trạng thái thu hồi khi đăng nhập lại.
+4. Thu hồi tin nhắn & File/Ảnh (Recall/Unsend): Nút '↩ Thu hồi' xóa nội dung/ảnh tại chỗ trên mọi màn hình theo thời gian thực.
 
 Chạy chương trình:
     py gui_client.py --name "Minh Khang"
@@ -20,7 +21,7 @@ import os
 import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from network_client import (
     EVENT_CONNECTED,
@@ -44,7 +45,7 @@ from storage import DEFAULT_ROOMS
 from transport import MAX_SIZE
 
 try:
-    from PIL import Image, ImageTk  # Tùy chọn: nếu máy có sẵn Pillow thì xem trước được cả JPG/WEBP
+    from PIL import Image, ImageTk
 
     HAS_PIL = True
 except Exception:
@@ -114,12 +115,13 @@ class PendingFileDownload:
     sender: str
     room: str
     timestamp: str
+    msg_id: Optional[int] = None
     is_history: bool = False
     chunks: Dict[int, bytes] = field(default_factory=dict)
 
 
 class ChatClientGUI:
-    """Cửa sổ giao diện Chat đa phòng, gửi file nhị phân & xem lịch sử SQLite."""
+    """Cửa sổ giao diện Chat đa phòng, gửi file nhị phân, lịch sử SQLite & thu hồi tin nhắn."""
 
     def __init__(
         self,
@@ -142,6 +144,8 @@ class ChatClientGUI:
 
         self._updating_room_listbox = False
         self._incoming_files: Dict[str, PendingFileDownload] = {}
+        self._outgoing_files: Dict[str, Tuple[str, bytes]] = {}
+        self._rendered_meta: Dict[int, Dict[str, object]] = {}
         self._widget_refs: List[object] = []
 
         self.host_var = tk.StringVar(value=initial_host)
@@ -163,7 +167,7 @@ class ChatClientGUI:
         self._update_byte_counter()
 
         self.append_system_log(
-            "Sẵn sàng. Chạy 'py chat_server.py', nhập tên rồi bấm 'Kết nối' để nạp lịch sử phòng và trò chuyện."
+            "Sẵn sàng. Chạy 'py chat_server.py', nhập tên rồi bấm 'Kết nối' để trò chuyện."
         )
         self.root.after(POLL_INTERVAL_MS, self._poll_network_events)
 
@@ -179,12 +183,13 @@ class ChatClientGUI:
         style.configure("Hint.TLabel", background="#F1F5F9", foreground="#64748B", font=("Segoe UI", 9))
         style.configure("Action.TButton", font=("Segoe UI", 9, "bold"), padding=(12, 4))
         style.configure("Secondary.TButton", font=("Segoe UI", 9), padding=(8, 3))
+        style.configure("Inline.TButton", font=("Segoe UI", 8), padding=(5, 1))
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        # 1. Thanh kết nối trên cùng (2 dòng gọn, không bao giờ tràn viền)
+        # 1. Thanh kết nối trên cùng
         top_card = tk.Frame(
             self.root,
             bg="#FFFFFF",
@@ -252,7 +257,6 @@ class ChatClientGUI:
         body_frame.columnconfigure(1, weight=1)
         body_frame.rowconfigure(0, weight=1)
 
-        # 2A. Sidebar Phòng chat bên trái
         sidebar_card = tk.Frame(
             body_frame,
             bg="#FFFFFF",
@@ -300,7 +304,6 @@ class ChatClientGUI:
         )
         self.join_room_btn.grid(row=4, column=0, sticky="ew")
 
-        # 2B. Khung hiển thị tin nhắn & hình ảnh bên phải
         chat_card = tk.Frame(
             body_frame,
             bg="#FFFFFF",
@@ -332,7 +335,7 @@ class ChatClientGUI:
             relief="flat",
             padx=12,
             pady=10,
-            spacing1=2,
+            spacing1=3,
             spacing3=6,
             cursor="arrow",
         )
@@ -347,6 +350,7 @@ class ChatClientGUI:
         self.chat_text.tag_configure("self_sender", foreground="#1D4ED8", font=("Segoe UI", 10, "bold"))
         self.chat_text.tag_configure("peer_sender", foreground="#047857", font=("Segoe UI", 10, "bold"))
         self.chat_text.tag_configure("body", foreground="#0F172A", font=("Segoe UI", 10))
+        self.chat_text.tag_configure("recalled", foreground="#94A3B8", font=("Segoe UI", 10, "italic"))
         self.chat_text.tag_configure("file_meta", foreground="#0369A1", font=("Segoe UI", 9, "bold"))
         self.chat_text.tag_configure("system", foreground="#475569", font=("Segoe UI", 9, "italic"))
         self.chat_text.tag_configure("error", foreground="#DC2626", font=("Segoe UI", 9, "bold"))
@@ -403,7 +407,7 @@ class ChatClientGUI:
 
         ttk.Label(
             info_bar,
-            text="Enter: Gửi  |  Shift+Enter: Xuống dòng  |  📎 Tối đa 5 MB  |  /quit: Rời phòng",
+            text="Enter: Gửi  |  Shift+Enter: Xuống dòng  |  ↩ Thu hồi cạnh tin đã gửi  |  /quit: Rời phòng",
             style="Hint.TLabel",
         ).grid(row=0, column=0, sticky="w")
 
@@ -427,7 +431,7 @@ class ChatClientGUI:
 
         min_w = min(req_w + int(24 * dpi_scale), int(scr_w * 0.92))
         min_h = min(max(req_h, int(460 * dpi_scale)), int(scr_h * 0.88))
-        init_w = min(max(min_w, int(780 * dpi_scale)), int(scr_w * 0.92))
+        init_w = min(max(min_w, int(800 * dpi_scale)), int(scr_w * 0.92))
         init_h = min(max(min_h, int(560 * dpi_scale)), int(scr_h * 0.88))
 
         self.root.minsize(min_w, min_h)
@@ -566,6 +570,7 @@ class ChatClientGUI:
 
     def _graceful_disconnect(self) -> None:
         self._incoming_files.clear()
+        self._outgoing_files.clear()
         if self.client.is_connected:
             try:
                 self.client.send_payload(encode_message(make_message("bye")))
@@ -638,12 +643,24 @@ class ChatClientGUI:
 
         filename = os.path.basename(filepath)
         try:
-            self.client.send_file_async(filename, raw_bytes)
+            file_id = self.client.send_file_async(filename, raw_bytes)
+            self._outgoing_files[file_id] = (filename, raw_bytes)
             self.append_system_log(
                 f"Đang truyền nhị phân '{filename}' ({format_size(len(raw_bytes))}) vào phòng #{self.current_room}..."
             )
         except Exception as err:
             self.append_error_log(str(err))
+
+    def request_recall(self, msg_id: int) -> None:
+        """Gửi yêu cầu thu hồi tin nhắn hoặc tệp theo `msg_id` lên server."""
+        if not self.client.is_connected:
+            self.append_error_log("Cần đang kết nối với server để thu hồi tin nhắn.")
+            return
+        try:
+            pkt = encode_message(make_message("recall", msg_id=msg_id))
+            self.client.send_payload(pkt)
+        except Exception as err:
+            self.append_error_log(f"Không thể gửi yêu cầu thu hồi: {err}")
 
     def send_current_message(self) -> None:
         content = self._get_input_content()
@@ -687,13 +704,6 @@ class ChatClientGUI:
             return
 
         if sent_ok:
-            self.append_chat_message(
-                sender=f"Bạn ({self.active_username})",
-                content=content,
-                timestamp=now_hhmmss(),
-                is_self=True,
-                is_history=False,
-            )
             self._clear_input()
             self.input_text.focus_set()
 
@@ -724,17 +734,8 @@ class ChatClientGUI:
             self.input_text.focus_set()
 
         elif event_type == EVENT_FILE_SENT:
-            if isinstance(data, dict):
-                fname = str(data.get("filename", "tep_dinh_kem"))
-                fbytes = bytes(data.get("data", b""))
-                self.append_file_message(
-                    sender=f"Bạn ({self.active_username})",
-                    filename=fname,
-                    file_bytes=fbytes,
-                    timestamp=now_hhmmss(),
-                    is_self=True,
-                    is_history=False,
-                )
+            # Đợi gói file_saved kèm msg_id từ server để gắn nút Thu hồi chính xác
+            return
 
         elif event_type == EVENT_MESSAGE:
             raw_bytes = bytes(data) if isinstance(data, (bytes, bytearray)) else b""
@@ -752,12 +753,14 @@ class ChatClientGUI:
 
         elif event_type == EVENT_DISCONNECTED:
             self._incoming_files.clear()
+            self._outgoing_files.clear()
             self.root.title("TCP Socket Chat — Đồ án Mạng máy tính")
             self._refresh_ui_state()
             self.append_system_log(str(data or "Đã ngắt kết nối."))
 
         elif event_type == EVENT_ERROR:
             self._incoming_files.clear()
+            self._outgoing_files.clear()
             self.root.title("TCP Socket Chat — Đồ án Mạng máy tính")
             self._refresh_ui_state()
             self.append_error_log(str(data or "Lỗi kết nối."))
@@ -799,15 +802,47 @@ class ChatClientGUI:
 
             sender = msg.get("sender") or "Server"
             is_hist = bool(msg.get("history", False))
-            is_self_hist = is_hist and sender == self.active_username
-            display_sender = f"Bạn ({sender})" if is_self_hist else sender
+            is_self = sender == self.active_username
+            display_sender = f"Bạn ({sender})" if is_self else sender
+            mid = msg.get("msg_id")
 
-            self.append_chat_message(
-                sender=display_sender,
-                content=msg["text"],
-                timestamp=ts,
-                is_self=is_self_hist,
-                is_history=is_hist,
+            if msg.get("recalled"):
+                self.append_recalled_placeholder(
+                    sender=display_sender,
+                    raw_sender=sender,
+                    timestamp=ts,
+                    is_self=is_self,
+                    is_history=is_hist,
+                    msg_id=mid,
+                )
+            else:
+                self.append_chat_message(
+                    sender=display_sender,
+                    raw_sender=sender,
+                    content=msg["text"],
+                    timestamp=ts,
+                    is_self=is_self,
+                    is_history=is_hist,
+                    msg_id=mid,
+                )
+
+        elif mtype == "file_saved":
+            fid = msg["file_id"]
+            cached = self._outgoing_files.pop(fid, None)
+            if cached is None:
+                return
+            if msg.get("room") and msg["room"] != self.current_room:
+                return
+            fname, fbytes = cached
+            self.append_file_message(
+                sender=f"Bạn ({self.active_username})",
+                raw_sender=self.active_username,
+                filename=fname,
+                file_bytes=fbytes,
+                timestamp=msg.get("timestamp") or now_hhmmss(),
+                is_self=True,
+                is_history=False,
+                msg_id=msg["msg_id"],
             )
 
         elif mtype == "file_start":
@@ -820,6 +855,7 @@ class ChatClientGUI:
                 sender=msg.get("sender") or "Server",
                 room=msg.get("room") or self.current_room,
                 timestamp=msg.get("timestamp") or now_hhmmss(),
+                msg_id=msg.get("msg_id"),
                 is_history=bool(msg.get("history", False)),
             )
 
@@ -831,17 +867,28 @@ class ChatClientGUI:
                 self.append_error_log(f"Nhận thiếu mảnh dữ liệu của tệp '{pending.filename}'.")
                 return
             assembled = b"".join(pending.chunks[i] for i in range(pending.total_chunks))
-            is_self_hist = pending.is_history and pending.sender == self.active_username
+            is_self = pending.sender == self.active_username
             display_sender = (
-                f"Bạn ({pending.sender})" if is_self_hist else pending.sender
+                f"Bạn ({pending.sender})" if is_self else pending.sender
             )
             self.append_file_message(
                 sender=display_sender,
+                raw_sender=pending.sender,
                 filename=pending.filename,
                 file_bytes=assembled,
                 timestamp=pending.timestamp,
-                is_self=is_self_hist,
+                is_self=is_self,
                 is_history=pending.is_history,
+                msg_id=pending.msg_id,
+            )
+
+        elif mtype == "recall":
+            if msg.get("room") and msg["room"] != self.current_room:
+                return
+            self.apply_message_recall(
+                msg_id=msg["msg_id"],
+                sender=msg.get("sender") or "",
+                timestamp=msg.get("timestamp") or "",
             )
 
         elif mtype == "bye":
@@ -900,6 +947,16 @@ class ChatClientGUI:
         except OSError as err:
             messagebox.showerror("Lỗi lưu tệp", f"Không thể ghi tệp:\n{err}", parent=self.root)
 
+    def _create_recall_button(self, msg_id: int) -> ttk.Button:
+        btn = ttk.Button(
+            self.chat_text,
+            text="↩ Thu hồi",
+            style="Inline.TButton",
+            command=lambda mid=msg_id: self.request_recall(mid),
+        )
+        self._widget_refs.append(btn)
+        return btn
+
     def append_chat_message(
         self,
         sender: str,
@@ -907,8 +964,12 @@ class ChatClientGUI:
         timestamp: str,
         is_self: bool = False,
         is_history: bool = False,
+        raw_sender: str = "",
+        msg_id: Optional[int] = None,
     ) -> None:
         self.chat_text.configure(state="normal")
+        start_idx = self.chat_text.index("end-1c")
+
         if is_history:
             self.chat_text.insert("end", f"[Lịch sử {timestamp}] ", "history_badge")
         else:
@@ -916,7 +977,22 @@ class ChatClientGUI:
 
         tag = "self_sender" if is_self else "peer_sender"
         self.chat_text.insert("end", f"{sender}: ", tag)
-        self.chat_text.insert("end", f"{content}\n", "body")
+        self.chat_text.insert("end", content, "body")
+
+        if is_self and msg_id is not None:
+            self.chat_text.insert("end", "  ")
+            self.chat_text.window_create("end", window=self._create_recall_button(msg_id))
+
+        end_idx = self.chat_text.index("end-1c")
+        if msg_id is not None:
+            self.chat_text.tag_add(f"msg_{msg_id}", start_idx, end_idx)
+            self._rendered_meta[msg_id] = {
+                "is_history": is_history,
+                "timestamp": timestamp,
+                "sender": raw_sender or sender,
+            }
+
+        self.chat_text.insert("end", "\n")
         self.chat_text.see("end")
         self.chat_text.configure(state="disabled")
 
@@ -928,8 +1004,12 @@ class ChatClientGUI:
         timestamp: str,
         is_self: bool = False,
         is_history: bool = False,
+        raw_sender: str = "",
+        msg_id: Optional[int] = None,
     ) -> None:
         self.chat_text.configure(state="normal")
+        start_idx = self.chat_text.index("end-1c")
+
         if is_history:
             self.chat_text.insert("end", f"[Lịch sử {timestamp}] ", "history_badge")
         else:
@@ -945,22 +1025,90 @@ class ChatClientGUI:
 
         save_btn = ttk.Button(
             self.chat_text,
-            text=f"💾 Lưu về máy",
-            style="Secondary.TButton",
+            text="💾 Lưu về máy",
+            style="Inline.TButton",
             command=lambda fn=filename, fb=file_bytes: self._save_received_file(fn, fb),
         )
         self._widget_refs.append(save_btn)
         self.chat_text.window_create("end", window=save_btn)
-        self.chat_text.insert("end", "\n")
+
+        if is_self and msg_id is not None:
+            self.chat_text.insert("end", " ")
+            self.chat_text.window_create("end", window=self._create_recall_button(msg_id))
 
         preview = self._try_build_image_preview(filename, file_bytes)
         if preview is not None:
             self._widget_refs.append(preview)
-            self.chat_text.insert("end", "    ")
+            self.chat_text.insert("end", "\n    ")
             self.chat_text.image_create("end", image=preview, padx=4, pady=4)
-            self.chat_text.insert("end", "\n")
 
+        end_idx = self.chat_text.index("end-1c")
+        if msg_id is not None:
+            self.chat_text.tag_add(f"msg_{msg_id}", start_idx, end_idx)
+            self._rendered_meta[msg_id] = {
+                "is_history": is_history,
+                "timestamp": timestamp,
+                "sender": raw_sender or sender,
+            }
+
+        self.chat_text.insert("end", "\n")
         self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
+
+    def append_recalled_placeholder(
+        self,
+        sender: str,
+        timestamp: str,
+        is_self: bool = False,
+        is_history: bool = False,
+        raw_sender: str = "",
+        msg_id: Optional[int] = None,
+    ) -> None:
+        self.chat_text.configure(state="normal")
+        if is_history:
+            self.chat_text.insert("end", f"[Lịch sử {timestamp}] ", "history_badge")
+        else:
+            self.chat_text.insert("end", f"[{timestamp}] ", "time")
+
+        tag = "self_sender" if is_self else "peer_sender"
+        self.chat_text.insert("end", f"{sender}: ", tag)
+        self.chat_text.insert("end", "🚫 Tin nhắn đã được thu hồi\n", "recalled")
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
+
+    def apply_message_recall(self, msg_id: int, sender: str, timestamp: str) -> None:
+        """Xóa ngay nội dung, hình ảnh & nút bấm của tin nhắn `msg_id` tại chỗ trên khung chat."""
+        tag_name = f"msg_{msg_id}"
+        ranges = self.chat_text.tag_ranges(tag_name)
+        if not ranges:
+            return
+
+        meta = self._rendered_meta.pop(msg_id, {})
+        is_hist = bool(meta.get("is_history", False))
+        ts = str(meta.get("timestamp") or timestamp or now_hhmmss())
+        orig_sender = sender or str(meta.get("sender") or "Người dùng")
+        is_self = orig_sender == self.active_username
+        display_sender = f"Bạn ({orig_sender})" if is_self else orig_sender
+
+        start_pos = self.chat_text.index(ranges[0])
+        end_pos = self.chat_text.index(ranges[-1])
+
+        prefix = f"[Lịch sử {ts}] " if is_hist else f"[{ts}] "
+        prefix_tag = "history_badge" if is_hist else "time"
+        sender_tag = "self_sender" if is_self else "peer_sender"
+
+        self.chat_text.configure(state="normal")
+        self.chat_text.delete(start_pos, end_pos)
+        self.chat_text.tag_delete(tag_name)
+        self.chat_text.insert(
+            start_pos,
+            prefix,
+            prefix_tag,
+            f"{display_sender}: ",
+            sender_tag,
+            "🚫 Tin nhắn đã được thu hồi",
+            "recalled",
+        )
         self.chat_text.configure(state="disabled")
 
     def append_system_log(self, message: str, timestamp: Optional[str] = None) -> None:
@@ -980,6 +1128,7 @@ class ChatClientGUI:
         self.chat_text.configure(state="normal")
         self.chat_text.delete("1.0", "end")
         self.chat_text.configure(state="disabled")
+        self._rendered_meta.clear()
         self._widget_refs.clear()
 
     def on_close(self) -> None:

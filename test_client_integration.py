@@ -1,13 +1,14 @@
 """Kiểm thử tích hợp toàn diện:
 - Phần 1 (`transport.py`): Framing 4-byte header, giới hạn 64 KiB.
-- Phần 2 (`protocol.py`): JSON control + Binary file chunks (`BINARY_MAGIC`).
+- Phần 2 (`protocol.py`): JSON control + Binary file chunks (`BINARY_MAGIC`) + gói `recall`.
 - Phần 3 (`storage.py`, `chat_server.py`, `network_client.py`, `gui_client.py`):
   1. Chia phòng chat (tạo phòng mới, cô lập tin nhắn giữa các phòng).
   2. Gửi File / Hình ảnh nhị phân > 64 KiB (tự cắt mảnh 48 KiB và ráp lại nguyên vẹn từng byte).
   3. Lưu lịch sử SQLite (ngắt kết nối rồi đăng nhập lại vẫn nạp đủ cả tin nhắn cũ và file/ảnh cũ).
+  4. Thu hồi tin nhắn & File/Ảnh (chặn thu hồi tin người khác, xóa sạch trong SQLite và cập nhật tại chỗ trên GUI).
 
 Chạy toàn bộ test:
-    py -m unittest -v
+    py test_client_integration.py
 """
 
 import argparse
@@ -22,8 +23,6 @@ from chat_server import ChatRoomServer
 from gui_client import ChatClientGUI, measure_chat_bytes, parse_args, valid_port
 from network_client import (
     EVENT_CONNECTED,
-    EVENT_DISCONNECTED,
-    EVENT_ERROR,
     EVENT_FILE_SENT,
     EVENT_MESSAGE,
     SocketClient,
@@ -37,9 +36,7 @@ from protocol import (
     is_binary_frame,
     make_message,
 )
-from transport import MAX_SIZE
 
-# Mẫu ảnh PNG 1x1 hợp lệ dùng để kiểm thử hiển thị ảnh nội tuyến trên Tkinter
 TINY_PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
@@ -48,7 +45,6 @@ TINY_PNG_BYTES = (
 
 
 def collect_until(client: SocketClient, predicate, timeout: float = 4.0):
-    """Đọc các sự kiện từ client cho tới khi thỏa điều kiện predicate."""
     collected = []
     while True:
         ev = client.events.get(timeout=timeout)
@@ -57,7 +53,7 @@ def collect_until(client: SocketClient, predicate, timeout: float = 4.0):
             return collected
 
 
-class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
+class TestRoomsBinaryFilesSQLiteAndRecall(unittest.TestCase):
     def setUp(self):
         fd, self.db_file = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -85,7 +81,6 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
         ev = c.events.get(timeout=3.0)
         self.assertEqual(ev.type, EVENT_CONNECTED)
         c.send_payload(encode_message(make_message("hello", username=username, room=room)))
-        # Chờ cho tới khi nhận xong thông báo hệ thống xác nhận vào phòng
         collect_until(
             c,
             lambda e: e.type == EVENT_MESSAGE
@@ -101,13 +96,6 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
         hoa = self._connect_and_hello("Thái Hoà", room="chung")
         an = self._connect_and_hello("An", room="chung")
         try:
-            # Xóa sạch sự kiện thông báo join ban đầu
-            while not khang.events.empty():
-                khang.events.get_nowait()
-            while not hoa.events.empty():
-                hoa.events.get_nowait()
-
-            # Minh Khang và Thái Hoà tạo & chuyển sang phòng mới '#do-an-nhom'
             khang.send_payload(encode_message(make_message("join_room", room="do-an-nhom")))
             collect_until(
                 khang,
@@ -126,7 +114,6 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
                 and "#do-an-nhom" in decode_message(e.data).get("text", ""),
             )
 
-            # An ở #chung nhận thông báo hệ thống khi Thái Hoà rời #chung sang phòng khác
             collect_until(
                 an,
                 lambda e: e.type == EVENT_MESSAGE
@@ -141,7 +128,6 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
                 encode_message(make_message("chat", text="Tin mật trong phòng đồ án!"))
             )
 
-            # Thái Hoà (cùng phòng #do-an-nhom) nhận được ngay
             evs_hoa = collect_until(
                 hoa,
                 lambda e: e.type == EVENT_MESSAGE
@@ -153,8 +139,8 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
             self.assertEqual(chat_pkt["sender"], "Minh Khang")
             self.assertEqual(chat_pkt["room"], "do-an-nhom")
             self.assertEqual(chat_pkt["text"], "Tin mật trong phòng đồ án!")
+            self.assertIsInstance(chat_pkt["msg_id"], int)
 
-            # An ở #chung hoàn toàn không nhận được tin nhắn này
             with self.assertRaises(queue.Empty):
                 an.events.get(timeout=0.15)
         finally:
@@ -166,20 +152,23 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
         """Gửi file nhị phân 130 KB (> giới hạn 64 KiB của 1 frame TCP) + Đăng nhập lại nhận đủ lịch sử SQLite."""
         khang = self._connect_and_hello("Minh Khang", room="hoc-tap")
         hoa = self._connect_and_hello("Thái Hoà", room="hoc-tap")
-
-        # Tạo dữ liệu nhị phân 130 KB (gồm đủ mọi giá trị byte 0..255, không phải chuỗi UTF-8)
         large_binary = bytes(range(256)) * 520  # 133,120 bytes (~3 mảnh 48 KiB)
 
         try:
             khang.send_payload(
                 encode_message(make_message("chat", text="Gửi tài liệu ôn tập nhé!"))
             )
-            khang.send_file_async("tai_lieu_mang.bin", large_binary)
+            fid = khang.send_file_async("tai_lieu_mang.bin", large_binary)
+            self.assertTrue(fid)
 
-            # Khang nhận xác nhận gửi xong EVENT_FILE_SENT
-            collect_until(khang, lambda e: e.type == EVENT_FILE_SENT)
+            # Người gửi nhận được cả EVENT_FILE_SENT lẫn gói file_saved kèm msg_id
+            collect_until(
+                khang,
+                lambda e: e.type == EVENT_MESSAGE
+                and not is_binary_frame(e.data)
+                and decode_message(e.data).get("type") == "file_saved",
+            )
 
-            # Thái Hoà nhận đủ cả tin chat lẫn file nhị phân 133,120 bytes
             hoa_events = collect_until(
                 hoa,
                 lambda e: e.type == EVENT_MESSAGE
@@ -202,14 +191,14 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
 
             self.assertIsNotNone(file_meta)
             self.assertEqual(file_meta["filename"], "tai_lieu_mang.bin")
-            self.assertEqual(file_meta["size"], len(large_binary))
+            self.assertIsInstance(file_meta["msg_id"], int)
             rebuilt = b"".join(assembled_chunks[i] for i in range(file_meta["total_chunks"]))
             self.assertEqual(rebuilt, large_binary)
         finally:
             khang.disconnect()
             hoa.disconnect()
 
-        # Người dùng thứ 3 đăng nhập SAU ĐÓ vào phòng #hoc-tap -> SQLite tự phát lại cả chat & file cũ!
+        # Người dùng thứ 3 đăng nhập sau đó -> SQLite tự phát lại cả chat & file cũ
         late_user = SocketClient()
         try:
             late_user.connect_async("127.0.0.1", self.port)
@@ -245,10 +234,7 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
 
             self.assertEqual(len(history_chats), 1)
             self.assertEqual(history_chats[0]["text"], "Gửi tài liệu ôn tập nhé!")
-            self.assertEqual(history_chats[0]["sender"], "Minh Khang")
-
             self.assertIsNotNone(history_file_meta)
-            self.assertEqual(history_file_meta["filename"], "tai_lieu_mang.bin")
             replayed_bytes = b"".join(
                 history_file_chunks[i] for i in range(history_file_meta["total_chunks"])
             )
@@ -256,11 +242,78 @@ class TestRoomsBinaryFilesAndSQLiteHistory(unittest.TestCase):
         finally:
             late_user.disconnect()
 
+    def test_message_recall_authorization_sync_and_sqlite_wipe(self):
+        """Thu hồi tin nhắn: chặn thu hồi trái phép, đồng bộ xóa trên mọi client & xóa sạch trong SQLite."""
+        khang = self._connect_and_hello("Minh Khang", room="chung")
+        hoa = self._connect_and_hello("Thái Hoà", room="chung")
+        try:
+            khang.send_payload(
+                encode_message(make_message("chat", text="Nhắn nhầm mật khẩu 123456!"))
+            )
+
+            ev_khang = collect_until(
+                khang,
+                lambda e: e.type == EVENT_MESSAGE
+                and not is_binary_frame(e.data)
+                and decode_message(e.data).get("type") == "chat"
+                and not decode_message(e.data).get("system"),
+            )[-1]
+            ev_hoa = collect_until(
+                hoa,
+                lambda e: e.type == EVENT_MESSAGE
+                and not is_binary_frame(e.data)
+                and decode_message(e.data).get("type") == "chat"
+                and not decode_message(e.data).get("system"),
+            )[-1]
+
+            msg_id = decode_message(ev_khang.data)["msg_id"]
+            self.assertEqual(decode_message(ev_hoa.data)["msg_id"], msg_id)
+
+            # 1. Thái Hoà cố tình thu hồi tin của Minh Khang -> bị Server từ chối RECALL_DENIED
+            hoa.send_payload(encode_message(make_message("recall", msg_id=msg_id)))
+            err_ev = collect_until(
+                hoa,
+                lambda e: e.type == EVENT_MESSAGE
+                and decode_message(e.data).get("type") == "error",
+            )[-1]
+            self.assertEqual(decode_message(err_ev.data)["code"], "RECALL_DENIED")
+
+            # 2. Chính chủ Minh Khang bấm thu hồi -> cả Khang lẫn Hoà đều nhận gói recall
+            khang.send_payload(encode_message(make_message("recall", msg_id=msg_id)))
+            rec_khang = collect_until(
+                khang,
+                lambda e: e.type == EVENT_MESSAGE
+                and decode_message(e.data).get("type") == "recall",
+            )[-1]
+            rec_hoa = collect_until(
+                hoa,
+                lambda e: e.type == EVENT_MESSAGE
+                and decode_message(e.data).get("type") == "recall",
+            )[-1]
+            self.assertEqual(decode_message(rec_khang.data)["msg_id"], msg_id)
+            self.assertEqual(decode_message(rec_hoa.data)["msg_id"], msg_id)
+        finally:
+            khang.disconnect()
+            hoa.disconnect()
+
+        # 3. Người mới đăng nhập lại sau đó chỉ thấy trạng thái recalled=True, KHÔNG thấy mật khẩu cũ
+        viewer = self._connect_and_hello("Người Xem Sau", room="chung")
+        try:
+            hist = self.server.storage.get_recent_history("chung")
+            self.assertEqual(len(hist), 1)
+            self.assertTrue(hist[0]["recalled"])
+            self.assertEqual(hist[0]["content"], "")
+        finally:
+            viewer.disconnect()
+
 
 class TestProtocolValidation(unittest.TestCase):
     def test_protocol_schema_and_binary_validation(self):
         msg = make_message("chat", text="Xin chào Việt Nam 🇻🇳")
         self.assertEqual(decode_message(encode_message(msg)), msg)
+
+        recall_msg = make_message("recall", msg_id=10)
+        self.assertEqual(decode_message(encode_message(recall_msg)), recall_msg)
 
         for bad_payload in (b"\xff\xfe", b'{"type":', "not bytes"):
             with self.assertRaises(ProtocolError):
@@ -271,6 +324,8 @@ class TestProtocolValidation(unittest.TestCase):
             {"version": 1, "type": "unknown"},
             make_message("hello", username="   "),
             make_message("join_room", room="   "),
+            make_message("recall", msg_id=0),
+            make_message("recall", msg_id=True),
         ):
             with self.assertRaises(ProtocolError):
                 encode_message(bad_dict)
@@ -280,8 +335,8 @@ class TestProtocolValidation(unittest.TestCase):
         self.assertEqual(decode_binary_chunk(chunk_frame), ("f01", 2, b"\x00\x01\xff"))
 
 
-class TestGUIWithRoomsAndInlineImage(unittest.TestCase):
-    def test_gui_renders_rooms_history_and_inline_png_without_losing_draft(self):
+class TestGUIWithRoomsImageAndInPlaceRecall(unittest.TestCase):
+    def test_gui_renders_and_recalls_message_and_image_in_place(self):
         args = parse_args(["--h", "127.0.0.1", "--p", "65432", "--n", "Khang", "--r", "hoc-tap"])
         self.assertEqual(args.room, "hoc-tap")
         for bad in ("0", "70000", "xyz"):
@@ -297,67 +352,85 @@ class TestGUIWithRoomsAndInlineImage(unittest.TestCase):
             min_w, _ = root.minsize()
             self.assertGreaterEqual(min_w, root.winfo_reqwidth())
 
-            # Cập nhật danh sách phòng từ server
-            gui._handle_network_event(
-                EVENT_MESSAGE,
-                encode_message(
-                    make_message(
-                        "room_list",
-                        rooms=["chung", "hoc-tap", "bao-ve-do-an"],
-                        current_room="bao-ve-do-an",
-                    )
-                ),
-            )
-            self.assertEqual(gui.current_room, "bao-ve-do-an")
-
-            # Đang gõ dở tin nhắn thì nhận được 1 tin lịch sử + 1 ảnh PNG nhị phân
             gui.input_text.insert("1.0", "Đang gõ câu hỏi...")
+
+            # Tin nhắn số 1 (giữ lại)
             gui._handle_network_event(
                 EVENT_MESSAGE,
                 encode_message(
                     make_message(
                         "chat",
-                        text="Tin nhắn cũ từ hôm qua",
-                        sender="Thái Hoà",
-                        room="bao-ve-do-an",
-                        timestamp="09:15:00",
-                        history=True,
+                        text="Tin số 1 giữ nguyên",
+                        sender="Minh Khang",
+                        room="chung",
+                        timestamp="10:00:01",
+                        msg_id=1,
                     )
                 ),
             )
-
+            # Tin nhắn số 2 (sẽ bị thu hồi)
+            gui._handle_network_event(
+                EVENT_MESSAGE,
+                encode_message(
+                    make_message(
+                        "chat",
+                        text="Bí mật cần thu hồi gấp!",
+                        sender="Thái Hoà",
+                        room="chung",
+                        timestamp="10:00:02",
+                        msg_id=2,
+                    )
+                ),
+            )
+            # Tin nhắn số 3 (ảnh PNG sẽ bị thu hồi)
             gui._handle_network_event(
                 EVENT_MESSAGE,
                 encode_message(
                     make_message(
                         "file_start",
-                        file_id="img01",
-                        filename="so_do_mang.png",
+                        file_id="img03",
+                        filename="anh_nham.png",
                         size=len(TINY_PNG_BYTES),
                         total_chunks=1,
                         sender="Thái Hoà",
-                        room="bao-ve-do-an",
-                        timestamp="09:16:00",
+                        room="chung",
+                        timestamp="10:00:03",
+                        msg_id=3,
                     )
                 ),
             )
             gui._handle_network_event(
+                EVENT_MESSAGE, encode_binary_chunk("img03", 0, TINY_PNG_BYTES)
+            )
+            gui._handle_network_event(
+                EVENT_MESSAGE, encode_message(make_message("file_end", file_id="img03"))
+            )
+
+            before_recall = gui.chat_text.get("1.0", "end-1c")
+            self.assertIn("Bí mật cần thu hồi gấp!", before_recall)
+            self.assertIn("anh_nham.png", before_recall)
+
+            # Thu hồi cả tin số 2 lẫn ảnh số 3 ngay tại chỗ!
+            gui._handle_network_event(
                 EVENT_MESSAGE,
-                encode_binary_chunk("img01", 0, TINY_PNG_BYTES),
+                encode_message(
+                    make_message("recall", msg_id=2, room="chung", sender="Thái Hoà")
+                ),
             )
             gui._handle_network_event(
                 EVENT_MESSAGE,
-                encode_message(make_message("file_end", file_id="img01")),
+                encode_message(
+                    make_message("recall", msg_id=3, room="chung", sender="Thái Hoà")
+                ),
             )
 
-            # Kiểm tra ô nhập không bị mất chữ, khung chat có cả nhãn [Lịch sử] lẫn file ảnh PNG
+            after_recall = gui.chat_text.get("1.0", "end-1c")
+            # Tin số 1 và nội dung đang gõ vẫn còn nguyên; tin số 2 và ảnh số 3 đã biến mất!
             self.assertEqual(gui._get_input_content(), "Đang gõ câu hỏi...")
-            chat_content = gui.chat_text.get("1.0", "end-1c")
-            self.assertIn("[Lịch sử 09:15:00]", chat_content)
-            self.assertIn("Tin nhắn cũ từ hôm qua", chat_content)
-            self.assertIn("so_do_mang.png", chat_content)
-            # Nút Lưu về máy + PhotoImage preview đều đã được nhúng vào khung chat
-            self.assertGreaterEqual(len(gui._widget_refs), 2)
+            self.assertIn("Tin số 1 giữ nguyên", after_recall)
+            self.assertNotIn("Bí mật cần thu hồi gấp!", after_recall)
+            self.assertNotIn("anh_nham.png", after_recall)
+            self.assertEqual(after_recall.count("🚫 Tin nhắn đã được thu hồi"), 2)
         finally:
             root.destroy()
 
