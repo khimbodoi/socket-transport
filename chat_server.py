@@ -790,6 +790,16 @@ class ChatRoomServer:
         if transfer is None:
             return
 
+        room_info = self.storage.get_room_info_and_members(transfer.room)
+        if (room_info is None or session.room != transfer.room
+                or session.username not in room_info["members"]):
+            self._send_to(
+                session,
+                make_message("error", code="FILE_ROOM_CHANGED",
+                             message="Đã hủy file vì bạn không còn ở phòng gửi ban đầu."),
+            )
+            return
+
         missing = [i for i in range(transfer.total_chunks) if i not in transfer.chunks]
         if missing:
             self._send_to(
@@ -858,6 +868,10 @@ class ChatRoomServer:
                     break
 
                 if is_binary_frame(raw):
+                    if not session.welcomed:
+                        self._send_to(session, make_message(
+                            "error", code="NEED_HELLO", message="Cần gửi hello trước"))
+                        continue
                     self._handle_binary_frame(session, raw)
                     continue
 
@@ -876,7 +890,17 @@ class ChatRoomServer:
 
                 msg_type = msg["type"]
 
+                if not session.welcomed and msg_type not in {"hello", "bye"}:
+                    self._send_to(session, make_message(
+                        "error", code="NEED_HELLO", message="Cần gửi hello trước"))
+                    continue
+
                 if msg_type == "hello":
+                    if session.welcomed:
+                        self._send_to(session, make_message(
+                            "error", code="ALREADY_HELLO",
+                            message="Không thể đổi tên trong cùng phiên. Hãy kết nối lại."))
+                        continue
                     session.username = self._unique_username(
                         msg["username"].strip(), conn
                     )
@@ -943,19 +967,26 @@ class ChatRoomServer:
                     content = msg["text"]
                     ts = now_hhmmss()
                     room = session.room
+                    outgoing = make_message(
+                        "chat", text=content, sender=session.username,
+                        room=room, timestamp=ts, msg_id=2**63 - 1,
+                    )
+                    # Phản hồi thêm sender/room/timestamp/id nên lớn hơn yêu cầu.
+                    # Kiểm tra trước khi lưu để tránh lưu tin không thể phát lại.
+                    try:
+                        encode_message(outgoing)
+                    except ProtocolError:
+                        self._send_to(session, make_message(
+                            "error", code="MESSAGE_TOO_LARGE",
+                            message="Tin nhắn quá lớn sau khi thêm thông tin người gửi/phòng."))
+                        continue
                     msg_id = self.storage.save_chat(
                         room=room, sender=session.username, text=content, timestamp=ts
                     )
+                    outgoing["msg_id"] = msg_id
                     recipients = self._broadcast_room_json(
                         room,
-                        make_message(
-                            "chat",
-                            text=content,
-                            sender=session.username,
-                            room=room,
-                            timestamp=ts,
-                            msg_id=msg_id,
-                        ),
+                        outgoing,
                         exclude_sock=None,
                     )
                     self._log(

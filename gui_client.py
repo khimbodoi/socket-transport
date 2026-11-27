@@ -586,10 +586,11 @@ class ChatClientGUI:
 
     def _request_switch_room(self, target_room: str, is_private: bool = False) -> None:
         if not self.client.is_connected:
+            if is_private:
+                self.append_error_log("Hãy kết nối tới server trước khi tạo phòng Private.")
+                return
             if target_room not in self.rooms:
                 self.rooms.append(target_room)
-            if is_private:
-                self.private_rooms.add(target_room)
             self.current_room = target_room
             self._explicit_connect_room = target_room
             self._populate_room_listbox()
@@ -1092,6 +1093,9 @@ class ChatClientGUI:
                 self.append_error_log(f"Nhận thiếu mảnh dữ liệu của tệp '{pending.filename}'.")
                 return
             assembled = b"".join(pending.chunks[i] for i in range(pending.total_chunks))
+            if len(assembled) != pending.expected_size:
+                self.append_error_log(f"Kích thước tệp '{pending.filename}' không khớp khai báo.")
+                return
             is_self = pending.sender == self.active_username
             display_sender = (
                 f"Bạn ({pending.sender})" if is_self else pending.sender

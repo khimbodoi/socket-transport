@@ -59,7 +59,7 @@ def _validate_message(message) -> None:
         raise ProtocolError("version không được hỗ trợ")
 
     msg_type = message.get("type")
-    if msg_type not in ALLOWED_TYPES:
+    if not isinstance(msg_type, str) or msg_type not in ALLOWED_TYPES:
         raise ProtocolError("type không hợp lệ")
 
     common = {"version", "type"}
@@ -186,6 +186,8 @@ def _validate_message(message) -> None:
     if msg_type == "file_start":
         if not message["file_id"].strip() or not message["filename"].strip():
             raise ProtocolError("file_id và filename không được để trống")
+        if len(message["file_id"].encode("utf-8")) > 64:
+            raise ProtocolError("file_id phải dài tối đa 64 byte UTF-8")
         size = message["size"]
         total_chunks = message["total_chunks"]
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -198,6 +200,9 @@ def _validate_message(message) -> None:
             or total_chunks < 0
         ):
             raise ProtocolError("total_chunks phải là số nguyên không âm")
+        expected_chunks = (size + FILE_CHUNK_SIZE - 1) // FILE_CHUNK_SIZE
+        if total_chunks != expected_chunks:
+            raise ProtocolError("total_chunks không khớp kích thước file và FILE_CHUNK_SIZE")
 
     if msg_type in {"file_end", "file_saved"} and not message["file_id"].strip():
         raise ProtocolError("file_id không được để trống")
@@ -256,8 +261,9 @@ def encode_binary_chunk(file_id: str, chunk_index: int, data: bytes) -> bytes:
     fid_bytes = file_id.strip().encode("utf-8")
     if not (1 <= len(fid_bytes) <= 64):
         raise ProtocolError("file_id nhị phân phải dài từ 1 đến 64 byte")
-    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
-        raise ProtocolError("chunk_index phải là số nguyên không âm")
+    if (isinstance(chunk_index, bool) or not isinstance(chunk_index, int)
+            or not 0 <= chunk_index < 2**32):
+        raise ProtocolError("chunk_index phải là số nguyên từ 0 đến 2**32 - 1")
 
     frame = (
         BINARY_MAGIC
