@@ -51,6 +51,7 @@ class SocketClient:
         self._connecting = False
         self._closing = False
         self._connection_id = 0
+        self._outgoing = None
 
     @property
     def is_connected(self) -> bool:
@@ -130,12 +131,23 @@ class SocketClient:
                 self._connected = True
                 self._connecting = False
 
+                outgoing = queue.Queue(maxsize=128)
+                self._outgoing = outgoing
+
+                send_thread = threading.Thread(
+                    target=self._send_loop,
+                    args=(sock, connection_id, outgoing),
+                    name="tcp-send-worker",
+                    daemon=True,
+                )
+
                 recv_thread = threading.Thread(
                     target=self._recv_loop,
                     args=(sock,),
                     name="tcp-recv-worker",
                     daemon=True,
                 )
+
                 self._recv_thread = recv_thread
 
                 self.events.put(
@@ -146,7 +158,76 @@ class SocketClient:
             self._close_raw_socket(sock)
             return
 
+        send_thread.start()
         recv_thread.start()
+
+        #D07
+    def send_payload_async(self, payload: bytes) -> bool:
+        """Đưa frame vào hàng đợi; không chờ gửi qua mạng."""
+        if not isinstance(payload, (bytes, bytearray)):
+            raise TypeError("Payload phải là bytes")
+
+        data = bytes(payload)
+
+        if len(data) > MAX_SIZE:
+            raise ValueError(
+                f"Thông điệp quá lớn: tối đa {MAX_SIZE} byte"
+            )
+
+        with self._state_lock:
+            if not self._connected or self._outgoing is None:
+                raise ConnectionError("Chưa có kết nối tới server")
+
+            try:
+                self._outgoing.put_nowait(data)
+            except queue.Full:
+                raise ValueError(
+                    "Hàng đợi gửi đang đầy. Hãy chờ rồi gửi lại."
+                ) from None
+
+        return True
+
+
+    def _send_loop(self, sock, connection_id, outgoing) -> None:
+        """Lấy frame trong hàng đợi và gửi trên luồng nền."""
+        while True:
+            with self._state_lock:
+                if (
+                    connection_id != self._connection_id
+                    or self._sock is not sock
+                    or not self._connected
+                ):
+                    return
+
+            try:
+                data = outgoing.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                with self._send_lock:
+                    with self._state_lock:
+                        if (
+                            connection_id != self._connection_id
+                            or self._sock is not sock
+                            or not self._connected
+                        ):
+                            return
+
+                    send_msg(sock, data)
+
+            except OSError as error:
+                if not self._cleanup_socket(target_sock=sock):
+                    self.events.put(
+                        NetworkEvent(
+                            EVENT_ERROR,
+                            f"Không thể gửi dữ liệu: {error}",
+                        )
+                    )
+                return
+
+            finally:
+                outgoing.task_done()
 
     def _recv_loop(self, sock: socket.socket) -> None:
         """Luồng nền đọc frame liên tục (cả JSON lẫn binary bytes) bằng recv_msg()."""
@@ -324,6 +405,7 @@ class SocketClient:
             self._sock = None
             self._connected = False
             self._connecting = False
+            self._outgoing = None
 
         if current_sock is not None:
             self._close_raw_socket(current_sock)

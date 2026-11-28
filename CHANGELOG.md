@@ -2,6 +2,33 @@
 
 Lịch sử thay đổi theo ngày, bản mới nhất ở trên. Chưa phát hành phiên bản có tag. Mã Dxx trỏ tới cùng một vấn đề trong biên bản và kế hoạch sửa; số issue/PR của GitHub là số riêng.
 
+## 2026-11-28 — Sửa D07: giao diện không chờ khóa gửi/mạng
+
+### Đã sửa
+
+- Chat, vào/rời/xóa phòng, xem thành viên, duyệt/kick, thu hồi và `hello` đều đưa frame vào hàng đợi riêng của kết nối. Worker gửi nền giữ khóa khi ghi socket; callback Tk không đứng chờ khóa gửi.
+- Hàng đợi tối đa 128 frame, báo đầy ngay. Khi đầy, giữ nội dung chat, không đặt nhầm cờ mở hộp thoại thành viên và không vô hiệu nút duyệt trước khi xếp hàng thành công.
+- Phân biệt **đã nối TCP** và **server đã xác nhận phiên**. GUI chỉ cho gửi chat/lệnh/file sau khi nhận `hello` từ server, tránh file chạy trước đăng ký phiên. Nếu không xếp hàng được `hello`, đóng phiên chưa đăng ký.
+- Ngắt kết nối đóng socket và bỏ các frame còn chờ, không đợi gửi `bye` hoặc đợi hàng đợi hết. Server xử lý EOF. Đây là chính sách hủy ngay; tin chưa gửi không được tự gửi lại sau reconnect.
+- Kiểm tra lại phiên sau hộp thoại chọn file, vì người dùng có thể đã ngắt/kết nối lại trong lúc hộp thoại mở.
+- **Đóng góp:** chủ dự án tự làm hàng đợi gửi và chuyển các lệnh GUI theo hướng dẫn; Codex hoàn thiện thứ tự `hello`, trạng thái phiên, kiểm thử và cập nhật tài liệu theo yêu cầu. Giữ tên hàm nghiệp vụ; `send_payload()` đồng bộ vẫn dành cho worker file, `send_payload_async()` nghĩa là đã xếp hàng, chưa phải server đã nhận.
+
+### Kiểm thử
+
+- Thêm 7 ca `test_ui_send_queue.py`: giao diện phản hồi khi khóa bận, chat đúng nội dung sau thả khóa, 7 lệnh quản lý chỉ xếp hàng, hàng đợi đầy, ngắt khi khóa bận, thứ tự hello/xác nhận, lỗi xếp hàng hello và phiên thay đổi trong hộp thoại file. Một ca có nhiều assertion.
+- Ca giữ khóa gửi thất bại đúng lỗi trên GUI cũ của `db50f2a`, rồi đạt trên bản sửa. [Log trước sửa](docs/kiem-thu/d07-before-20261128.txt).
+- **7/7 ca D07 đạt; toàn bộ 31/31 đạt cục bộ**, gồm bộ tích hợp, echo, GUI và D03. [Log D07](docs/kiem-thu/d07-20261128.txt), [log tổng hợp](docs/kiem-thu/d07-full-20261128.txt).
+
+```powershell
+python -X utf8 -m unittest -v test_client_integration test_regression test_network_lifecycle test_ui_send_queue
+```
+
+### Phần còn lại
+
+- D07 đã xử lý việc callback GUI chờ khóa/socket trong phạm vi trên. Chưa bổ sung deadline tổng cho gửi/đăng ký phiên, trạng thái tin “đang gửi/đã nhận”, hoặc retry tự động. Server không trả hello thì GUI vẫn cho ngắt nhưng chưa tự hết hạn chờ phiên.
+- D01, D02, D04–D06, D08–D11 vẫn mở. Theo dõi tiếp D03 về tác vụ file đang chạy/sự kiện cũ khi đổi phiên và thử LAN hai máy vẫn mở. Không chạy lại toàn bộ 14 ca audit trong đợt này.
+- Theo dõi nhận việc tại [issue #3](https://github.com/khimbodoi/socket-transport/issues/3). Các kết quả D03/audit bên dưới là lịch sử ở thời điểm đó.
+
 ## 2026-11-28 — Sửa D03: kết nối lại không bị worker cũ ghi đè
 
 ### Đã sửa

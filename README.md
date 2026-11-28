@@ -117,7 +117,7 @@ Không có knowledge graph sẵn trong repo; quan hệ module ở trên được
 ## Kiểm thử
 
 ```powershell
-python -X utf8 -m unittest -v test_client_integration test_regression test_network_lifecycle
+python -X utf8 -m unittest -v test_client_integration test_regression test_network_lifecycle test_ui_send_queue
 ```
 
 Kết quả tại thời điểm tích hợp: **20 bài đạt**, gồm TCP thật, hai GUI, SQLite tạm, file đến 5 MiB và echo cũ. Test tự dùng port rảnh/DB tạm; không cần bật server trước. Cần môi trường có màn hình và Tkinter cho các bài GUI. Không dùng `unittest discover` tùy tiện: `test_oversize.py` là script thao tác mạng khi import, không phải unittest.
@@ -125,6 +125,8 @@ Kết quả tại thời điểm tích hợp: **20 bài đạt**, gồm TCP th�
 Kiểm thử bổ sung ngày **28/11/2026**: bộ hiện có vẫn đạt 20/20; bộ chuyên sâu 14 ca có **11 ca không đạt và 3 ca đạt**, cùng kết quả qua ba lần chạy. Các vấn đề đang mở gồm vòng đời kết nối, thao tác phòng đồng thời, thứ tự lịch sử/thu hồi, giới hạn dữ liệu và độ phản hồi GUI. Chưa sửa code ứng dụng trong đợt ghi nhận này.
 
 Cập nhật tiếp ngày **28/11/2026**: D03 đã sửa phần worker kết nối cũ ghi đè phiên mới. Bộ tổng hợp thêm 4 ca hồi quy D03, hiện **24/24 đạt**; các mục lỗi còn lại vẫn đang mở. Xem [changelog](CHANGELOG.md) và [checklist nhận việc/lỗi #3](https://github.com/khimbodoi/socket-transport/issues/3).
+
+D07 đã sửa phần GUI chờ gửi mạng: hàng đợi 128 frame, gửi nền, chờ server xác nhận hello trước thao tác và ngắt hủy các frame còn chờ. Bộ tổng hợp hiện **31/31 đạt**; chưa có deadline tổng hoặc trạng thái xác nhận cho từng tin.
 
 Xem [kiểm thử thủ công](docs/KIEM_THU.md), [báo cáo kết quả](docs/KET_QUA_KIEM_THU.md), [kế hoạch sửa](docs/KE_HOACH_FIX.md) và [trạng thái GitHub](docs/KIEM_TRA_GITHUB.md). Kết quả bộ cũ không phải bằng chứng mọi tình huống đều đạt.
 

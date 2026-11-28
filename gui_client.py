@@ -142,6 +142,7 @@ class ChatClientGUI:
         self.root.configure(bg="#F1F5F9")
 
         self.client = SocketClient()
+        self._session_ready = False
         self.active_username = initial_name
 
         norm_init = normalize_room_name(initial_room) if initial_room else ""
@@ -599,24 +600,28 @@ class ChatClientGUI:
             )
             return
 
+        if not self._session_ready:
+            self.append_error_log("Đang chờ server xác nhận phiên.")
+            return
+
         # Giữ highlight phòng hiện tại cho tới khi Server xác nhận cho vào qua gói room_list
         self._populate_room_listbox()
         try:
             pkt = encode_message(
                 make_message("join_room", room=target_room, is_private=is_private)
             )
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
         except Exception as err:
             self.append_error_log(f"Không thể gửi yêu cầu vào phòng #{target_room}: {err}")
 
     def request_members_check(self, open_dialog: bool = False) -> None:
-        if not self.client.is_connected:
-            self.append_error_log("Hãy kết nối tới server trước khi kiểm tra thành viên.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
-        self._open_dialog_on_next_members = open_dialog
         try:
             pkt = encode_message(make_message("get_members", room=self.current_room))
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
+            self._open_dialog_on_next_members = open_dialog
         except Exception as err:
             self.append_error_log(f"Không thể lấy danh sách thành viên: {err}")
 
@@ -624,54 +629,66 @@ class ChatClientGUI:
         self.request_members_check(open_dialog=True)
 
     def send_approve_decision(
-        self, room: str, target_user: str, approve: bool, btn_pair: Optional[Tuple[ttk.Button, ttk.Button]] = None
+        self,
+        room: str,
+        target_user: str,
+        approve: bool,
+        btn_pair: Optional[Tuple[ttk.Button, ttk.Button]] = None,
     ) -> None:
-        if btn_pair is not None:
-            for b in btn_pair:
-                try:
-                    b.configure(state="disabled")
-                except Exception:
-                    pass
-        if not self.client.is_connected:
-            self.append_error_log("Chưa kết nối tới server.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
+
         try:
             pkt = encode_message(
                 make_message(
-                    "approve_join", room=room, target=target_user, approve=approve
+                    "approve_join",
+                    room=room,
+                    target=target_user,
+                    approve=approve,
                 )
             )
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
+
+            if btn_pair is not None:
+                for b in btn_pair:
+                    try:
+                        b.configure(state="disabled")
+                    except Exception:
+                        pass
+
         except Exception as err:
-            self.append_error_log(f"Không thể gửi phản hồi duyệt: {err}")
+            self.append_error_log(
+                f"Không thể gửi phản hồi duyệt: {err}"
+            )
 
     def send_kick_member(self, room: str, target_user: str) -> None:
-        if not self.client.is_connected:
-            self.append_error_log("Chưa kết nối tới server.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
         try:
             pkt = encode_message(
                 make_message("kick_member", room=room, target=target_user)
             )
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
         except Exception as err:
             self.append_error_log(f"Không thể kick thành viên: {err}")
 
     def leave_current_room(self) -> None:
-        if not self.client.is_connected:
-            self.append_error_log("Hãy kết nối tới server trước khi thực hiện.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
         if self.current_room == LOBBY_ROOM:
             return
         try:
             pkt = encode_message(make_message("leave_room", room=self.current_room))
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
         except Exception as err:
             self.append_error_log(f"Không thể rời phòng: {err}")
 
     def delete_current_room(self, confirm: bool = True) -> None:
-        if not self.client.is_connected:
-            self.append_error_log("Hãy kết nối tới server trước khi thực hiện.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
         room = self.current_room
         if room == LOBBY_ROOM:
@@ -689,7 +706,7 @@ class ChatClientGUI:
                 return
         try:
             pkt = encode_message(make_message("delete_room", room=room))
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
         except Exception as err:
             self.append_error_log(f"Không thể xóa phòng: {err}")
 
@@ -731,8 +748,9 @@ class ChatClientGUI:
             self.status_label.configure(fg="#D97706")
         elif self.client.is_connected:
             self.connect_btn.configure(text="Ngắt kết nối", state="normal")
-            self.send_btn.configure(state="normal")
-            self.attach_btn.configure(state="normal")
+            action_state = "normal" if self._session_ready else "disabled"
+            self.send_btn.configure(state=action_state)
+            self.attach_btn.configure(state=action_state)
             self.host_entry.configure(state="disabled")
             self.port_entry.configure(state="disabled")
             self.name_entry.configure(state="disabled")
@@ -740,7 +758,9 @@ class ChatClientGUI:
             self.status_var.set(
                 f"● Đã kết nối{target} — {self.active_username}  |  Phòng: #{self.current_room}"
             )
-            self.status_label.configure(fg="#16A34A")
+            if not self._session_ready:
+                self.status_var.set("● Đã nối TCP — đang chờ server xác nhận phiên…")
+            self.status_label.configure(fg="#16A34A" if self._session_ready else "#D97706")
         else:
             self.connect_btn.configure(text="Kết nối", state="normal")
             self.send_btn.configure(state="disabled")
@@ -754,14 +774,11 @@ class ChatClientGUI:
         self._update_room_banner_and_action_btn()
 
     def _graceful_disconnect(self) -> None:
+        self._session_ready = False
         self._incoming_files.clear()
         self._outgoing_files.clear()
         self._explicit_connect_room = None
-        if self.client.is_connected:
-            try:
-                self.client.send_payload(encode_message(make_message("bye")))
-            except Exception:
-                pass
+
         self.client.disconnect()
         self._refresh_ui_state()
 
@@ -793,15 +810,17 @@ class ChatClientGUI:
 
         self.active_username = username
         self.clear_chat_history()
+        self._session_ready = False
         if self.client.connect_async(host, port, timeout=5.0):
             self.append_system_log(f"Đang kết nối tới {host}:{port}...")
             self._refresh_ui_state()
 
     def choose_and_send_file(self) -> None:
-        if not self.client.is_connected:
-            self.append_error_log("Hãy kết nối tới server trước khi gửi file/hình ảnh.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
 
+        connection_id = self.client._connection_id
         filepath = filedialog.askopenfilename(
             parent=self.root,
             title="Chọn hình ảnh hoặc tệp cần gửi qua Socket",
@@ -827,6 +846,11 @@ class ChatClientGUI:
             self.append_error_log(f"Không thể đọc tệp: {err}")
             return
 
+        if (not self.client.is_connected or not self._session_ready
+                or connection_id != self.client._connection_id):
+            self.append_error_log("Phiên đã thay đổi trong lúc chọn file. Hãy chọn gửi lại.")
+            return
+
         filename = os.path.basename(filepath)
         try:
             file_id = self.client.send_file_async(filename, raw_bytes)
@@ -838,12 +862,12 @@ class ChatClientGUI:
             self.append_error_log(str(err))
 
     def request_recall(self, msg_id: int) -> None:
-        if not self.client.is_connected:
-            self.append_error_log("Cần đang kết nối với server để thu hồi tin nhắn.")
+        if not self.client.is_connected or not self._session_ready:
+            self.append_error_log("Phiên chưa sẵn sàng. Hãy chờ server xác nhận.")
             return
         try:
             pkt = encode_message(make_message("recall", msg_id=msg_id))
-            self.client.send_payload(pkt)
+            self.client.send_payload_async(pkt)
         except Exception as err:
             self.append_error_log(f"Không thể gửi yêu cầu thu hồi: {err}")
 
@@ -857,6 +881,10 @@ class ChatClientGUI:
                 self._graceful_disconnect()
             else:
                 self.append_system_log("Hiện chưa có kết nối nào đang mở.")
+            return
+
+        if self.client.is_connected and not self._session_ready:
+            self.append_error_log("Đang chờ server xác nhận phiên.")
             return
 
         # Lệnh nhanh '///' hoặc '/members' để kiểm tra danh sách thành viên trong phòng
@@ -903,13 +931,13 @@ class ChatClientGUI:
             return
 
         try:
-            sent_ok = self.client.send_payload(payload)
+            queued_ok = self.client.send_payload_async(payload)
         except (ValueError, ConnectionError) as err:
             self.append_error_log(str(err))
             self._refresh_ui_state()
             return
 
-        if sent_ok:
+        if queued_ok:
             self._clear_input()
             self.input_text.focus_set()
 
@@ -926,6 +954,7 @@ class ChatClientGUI:
 
     def _handle_network_event(self, event_type: str, data: object) -> None:
         if event_type == EVENT_CONNECTED:
+            self._session_ready = False
             endpoint = str(data or "")
             self._refresh_ui_state(endpoint=endpoint)
             try:
@@ -938,9 +967,10 @@ class ChatClientGUI:
                     self._explicit_connect_room = None
                 else:
                     hello_pkt = make_message("hello", username=self.active_username)
-                self.client.send_payload(encode_message(hello_pkt))
+                self.client.send_payload_async(encode_message(hello_pkt))
             except Exception as err:
                 self.append_error_log(f"Không thể gửi gói hello: {err}")
+                self._graceful_disconnect()
             self.input_text.focus_set()
 
         elif event_type == EVENT_FILE_SENT:
@@ -961,6 +991,7 @@ class ChatClientGUI:
             self._handle_decoded_json_message(msg)
 
         elif event_type == EVENT_DISCONNECTED:
+            self._session_ready = False
             self._incoming_files.clear()
             self._outgoing_files.clear()
             self.root.title("TCP Socket Chat — Đồ án Mạng máy tính")
@@ -968,6 +999,8 @@ class ChatClientGUI:
             self.append_system_log(str(data or "Đã ngắt kết nối."))
 
         elif event_type == EVENT_ERROR:
+            if not self.client.is_connected:
+                self._session_ready = False
             self._incoming_files.clear()
             self._outgoing_files.clear()
             self.root.title("TCP Socket Chat — Đồ án Mạng máy tính")
@@ -989,6 +1022,7 @@ class ChatClientGUI:
         mtype = msg["type"]
 
         if mtype == "hello":
+            self._session_ready = True
             self.active_username = msg["username"]
             self.root.title(f"TCP Socket Chat — {self.active_username}")
             self._populate_room_listbox()

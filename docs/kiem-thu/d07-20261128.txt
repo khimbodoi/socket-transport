@@ -1,0 +1,12 @@
+test_chat_keeps_tk_responsive_and_delivers_after_lock_release (test_ui_send_queue.TestUISendQueue.test_chat_keeps_tk_responsive_and_delivers_after_lock_release) ... ok
+test_control_callbacks_only_enqueue_under_busy_send_lock (test_ui_send_queue.TestUISendQueue.test_control_callbacks_only_enqueue_under_busy_send_lock) ... ok
+test_disconnect_ignores_busy_send_lock_and_discards_pending_frames (test_ui_send_queue.TestUISendQueue.test_disconnect_ignores_busy_send_lock_and_discards_pending_frames) ... ok
+test_file_dialog_cannot_send_into_a_changed_session (test_ui_send_queue.TestUISendQueue.test_file_dialog_cannot_send_into_a_changed_session) ... ok
+test_full_queue_preserves_input_dialog_flag_and_approval_buttons (test_ui_send_queue.TestUISendQueue.test_full_queue_preserves_input_dialog_flag_and_approval_buttons) ... ok
+test_hello_enqueue_failure_closes_unregistered_session (test_ui_send_queue.TestUISendQueue.test_hello_enqueue_failure_closes_unregistered_session) ... ok
+test_hello_is_queued_and_requests_wait_for_server_ack (test_ui_send_queue.TestUISendQueue.test_hello_is_queued_and_requests_wait_for_server_ack) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 2.998s
+
+OK
