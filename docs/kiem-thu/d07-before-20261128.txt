@@ -1,0 +1,15 @@
+test_chat_keeps_tk_responsive_and_delivers_after_lock_release (test_ui_send_queue.TestUISendQueue.test_chat_keeps_tk_responsive_and_delivers_after_lock_release) ... FAIL
+
+======================================================================
+FAIL: test_chat_keeps_tk_responsive_and_delivers_after_lock_release (test_ui_send_queue.TestUISendQueue.test_chat_keeps_tk_responsive_and_delivers_after_lock_release)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\mạng máy tính\tmp\socket-audit-20261128\test_ui_send_queue.py", line 70, in test_chat_keeps_tk_responsive_and_delivers_after_lock_release
+    self.assertLess(elapsed, 0.15)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+AssertionError: 0.4026061999902595 not less than 0.15
+
+----------------------------------------------------------------------
+Ran 1 test in 1.329s
+
+FAILED (failures=1)

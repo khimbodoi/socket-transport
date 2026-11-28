@@ -158,3 +158,12 @@ Gửi tiếng Việt, Enter trống, `/quit`, rồi chạy client lần nữa. S
 ## 12. Ghi kết quả
 
 Ghi phiên bản commit, Python, tên ca, đạt/không đạt, log lỗi và ảnh hai cửa sổ. LAN hai máy thật, tải nhiều người dùng và ảnh JPEG/Pillow chưa nằm trong kết quả đã xác minh lần này.
+
+
+## Bổ sung nghiệm thu D07: gửi nền và đăng ký phiên
+
+- Sau khi nối TCP, trước xác nhận hello: trạng thái báo đang chờ, nút Gửi/Đính kèm chưa bật. Sau xác nhận, nút bật và gửi chat/file được bình thường.
+- Khi gửi file, thử chat và xem thành viên/thu hồi/đổi phòng; cửa sổ vẫn phản hồi. File đang truyền khi đổi phòng vẫn có các giới hạn nêu trong kế hoạch sửa, không coi đó đã hết lỗi.
+- Ngắt kết nối khi đang chờ gửi: UI phản hồi; frame còn chờ bị bỏ, không tự phát lại khi nối lại. Tin mất mạng sau enqueue chưa được bảo đảm đã đến server.
+- Test tự động chủ động giữ khóa để tạo tình huống ổn định: `python -X utf8 -m unittest -v test_ui_send_queue`. Không dùng file lớn chạy nhanh trên localhost làm bằng chứng duy nhất về độ phản hồi.
+- Chưa có deadline tổng chờ hello; nếu server không xác nhận, có thể bấm ngắt. Không đánh dấu timeout đăng ký phiên là đã hoàn thành.

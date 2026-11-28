@@ -2,6 +2,14 @@
 
 **Trạng thái: bản nháp chờ chủ dự án review; còn các ca chuyên sâu không đạt, chưa chốt nghiệm thu.**
 
+## Cập nhật sau khi sửa D07 — 28/11/2026
+
+Đã chuyển các lời gọi gửi từ GUI sang hàng đợi có giới hạn, giữ giao diện phản hồi khi khóa gửi bận. Thêm chờ server xác nhận hello trước chat/lệnh/file; ngắt kết nối hủy ngay các frame chờ. Chủ dự án tự làm phần đầu; Codex hoàn thiện trạng thái phiên/hello và kiểm thử theo yêu cầu.
+
+7 ca D07 đạt; bộ tổng hợp **31/31 đạt**, bao gồm 4 bài D03 và 20 bài trước đó. Ca hồi quy giữ khóa thất bại trên GUI cũ tại `db50f2a` và đạt trên bản sửa. Xem [log D07](kiem-thu/d07-20261128.txt), [log tổng hợp](kiem-thu/d07-full-20261128.txt) và [changelog](../CHANGELOG.md). Đây là kiểm thử cục bộ, không phải CI hoặc LAN hai máy.
+
+Chưa chạy lại toàn bộ 14 ca audit; không đổi các kết quả lịch sử bên dưới thành đạt. D01, D02, D04–D06, D08–D11 còn mở. Deadline tổng cho gửi/hello và tác vụ file qua đổi phiên vẫn cần theo dõi.
+
 ## Cập nhật sau khi sửa D03 — 28/11/2026
 
 Chủ dự án đã tự sửa `network_client.py` bằng mã riêng cho từng lần kết nối. Codex kiểm tra lại: ca tái hiện gốc đạt 3/3; 4 ca hồi quy mới trong `test_network_lifecycle.py` đạt, bao gồm thành công/timeout/từ chối/lỗi socket đến muộn. Bộ tổng hợp **24/24 đạt** trên bản chuẩn bị đưa lên GitHub; xem [log](kiem-thu/d03-full-20261128.txt) và [changelog](../CHANGELOG.md).
