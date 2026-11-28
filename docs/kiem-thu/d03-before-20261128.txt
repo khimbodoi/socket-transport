@@ -1,0 +1,29 @@
+test_cancelled_success_cannot_replace_new_socket (test_network_lifecycle.TestConnectionGeneration.test_cancelled_success_cannot_replace_new_socket) ... FAIL
+
+======================================================================
+FAIL: test_cancelled_success_cannot_replace_new_socket (test_network_lifecycle.TestConnectionGeneration.test_cancelled_success_cannot_replace_new_socket)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\mạng máy tính\tmp\socket-audit-20261128\test_network_lifecycle.py", line 114, in test_cancelled_success_cannot_replace_new_socket
+    self.check_cancelled_attempt()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\User\Documents\mạng máy tính\tmp\socket-audit-20261128\test_network_lifecycle.py", line 91, in check_cancelled_attempt
+    self.assertEqual(client._sock.getpeername(), endpoints[1])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: ('127.0.0.1', 50304) != ('127.0.0.1', 50305)
+
+First differing element 1:
+50304
+50305
+
+- ('127.0.0.1', 50304)
+?                   ^
+
++ ('127.0.0.1', 50305)
+?                   ^
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.039s
+
+FAILED (failures=1)

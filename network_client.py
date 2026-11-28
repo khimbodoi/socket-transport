@@ -50,6 +50,7 @@ class SocketClient:
         self._connected = False
         self._connecting = False
         self._closing = False
+        self._connection_id = 0
 
     @property
     def is_connected(self) -> bool:
@@ -62,80 +63,89 @@ class SocketClient:
             return self._connecting
 
     def connect_async(self, host: str, port: int, timeout: float = 5.0) -> bool:
-        """Bắt đầu kết nối TCP trên luồng phụ để không làm đơ cửa sổ giao diện."""
+        """Bắt đầu kết nối TCP trên luồng phụ."""
         with self._state_lock:
             if self._connected or self._connecting:
                 return False
+
+            self._connection_id += 1
+            connection_id = self._connection_id
+
             self._connecting = True
             self._closing = False
 
         worker = threading.Thread(
             target=self._connect_worker,
-            args=(host, port, timeout),
+            args=(host, port, timeout, connection_id),
             name="tcp-connect-worker",
             daemon=True,
         )
         worker.start()
         return True
 
-    def _connect_worker(self, host: str, port: int, timeout: float) -> None:
+    def _connect_worker(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        connection_id: int,
+    ) -> None:
         sock: Optional[socket.socket] = None
+
         try:
             sock = socket.create_connection((host, port), timeout=timeout)
             sock.settimeout(None)
-        except TimeoutError:
-            with self._state_lock:
-                self._connecting = False
-            self.events.put(
-                NetworkEvent(
-                    EVENT_ERROR,
-                    f"Hết thời gian chờ kết nối tới {host}:{port} (quá {timeout:g} giây).",
+
+        except OSError as error:
+            if sock is not None:
+                self._close_raw_socket(sock)
+
+            if isinstance(error, TimeoutError):
+                message = (
+                    f"Hết thời gian chờ kết nối tới {host}:{port} "
+                    f"(quá {timeout:g} giây)."
                 )
-            )
-            return
-        except ConnectionRefusedError:
-            with self._state_lock:
-                self._connecting = False
-            self.events.put(
-                NetworkEvent(
-                    EVENT_ERROR,
-                    f"Kết nối tới {host}:{port} bị từ chối. Hãy kiểm tra chat_server.py đã bật và đúng IP/port.",
+            elif isinstance(error, ConnectionRefusedError):
+                message = (
+                    f"Kết nối tới {host}:{port} bị từ chối. "
+                    "Hãy kiểm tra server và IP/port."
                 )
-            )
-            return
-        except ConnectionError as err:
+            else:
+                message = f"Không thể kết nối tới {host}:{port}: {error}"
+
             with self._state_lock:
+                if connection_id != self._connection_id:
+                    return
+
                 self._connecting = False
-            self.events.put(NetworkEvent(EVENT_ERROR, f"Lỗi kết nối mạng: {err}"))
-            return
-        except OSError as err:
-            with self._state_lock:
-                self._connecting = False
-            self.events.put(
-                NetworkEvent(EVENT_ERROR, f"Không thể kết nối tới {host}:{port}: {err}")
-            )
+                self.events.put(NetworkEvent(EVENT_ERROR, message))
+
             return
 
         with self._state_lock:
-            if self._closing:
+            if connection_id != self._connection_id or self._closing:
+                recv_thread = None
+            else:
+                self._sock = sock
+                self._connected = True
                 self._connecting = False
-                self._close_raw_socket(sock)
-                self.events.put(NetworkEvent(EVENT_DISCONNECTED, "Đã hủy kết nối."))
-                return
 
-            self._sock = sock
-            self._connected = True
-            self._connecting = False
+                recv_thread = threading.Thread(
+                    target=self._recv_loop,
+                    args=(sock,),
+                    name="tcp-recv-worker",
+                    daemon=True,
+                )
+                self._recv_thread = recv_thread
 
-        self.events.put(NetworkEvent(EVENT_CONNECTED, f"{host}:{port}"))
+                self.events.put(
+                    NetworkEvent(EVENT_CONNECTED, f"{host}:{port}")
+                )
 
-        recv_thread = threading.Thread(
-            target=self._recv_loop,
-            args=(sock,),
-            name="tcp-recv-worker",
-            daemon=True,
-        )
-        self._recv_thread = recv_thread
+        if recv_thread is None:
+            self._close_raw_socket(sock)
+            return
+
         recv_thread.start()
 
     def _recv_loop(self, sock: socket.socket) -> None:
@@ -304,6 +314,8 @@ class SocketClient:
             current_sock = self._sock
             if target_sock is not None and current_sock is not target_sock:
                 return True
+
+            self._connection_id += 1
 
             was_intentional = self._closing or intentional
             if intentional:

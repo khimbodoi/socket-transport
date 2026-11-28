@@ -1,0 +1,30 @@
+test_binary_file_sqlite_history_and_recall (test_client_integration.TestFullChatSystem.test_binary_file_sqlite_history_and_recall) ... ok
+test_private_room_join_request_approval_member_check_and_kick (test_client_integration.TestFullChatSystem.test_private_room_join_request_approval_member_check_and_kick)
+Kiểm chứng trọn vẹn: ... ok
+test_room_persistence_on_relogin_member_leave_and_admin_delete (test_client_integration.TestFullChatSystem.test_room_persistence_on_relogin_member_leave_and_admin_delete) ... ok
+test_protocol_and_gui_triple_slash_and_private_controls (test_client_integration.TestProtocolAndGUIControls.test_protocol_and_gui_triple_slash_and_private_controls) ... ok
+test_bad_json_and_oversized_frame_recovery (test_regression.TestChatRegression.test_bad_json_and_oversized_frame_recovery) ... ok
+test_binary_exact_bytes_zero_max_and_restart_history (test_regression.TestChatRegression.test_binary_exact_bytes_zero_max_and_restart_history) ... ok
+test_file_cannot_finish_in_room_after_kick (test_regression.TestChatRegression.test_file_cannot_finish_in_room_after_kick) ... ok
+test_hello_required_and_cannot_change_identity_mid_session (test_regression.TestChatRegression.test_hello_required_and_cannot_change_identity_mid_session) ... ok
+test_largest_client_chat_is_rejected_without_disconnect (test_regression.TestChatRegression.test_largest_client_chat_is_rejected_without_disconnect) ... ok
+test_multi_client_unicode_isolation_and_identity (test_regression.TestChatRegression.test_multi_client_unicode_isolation_and_identity) ... ok
+test_private_reject_reapply_kick_and_delete_permissions (test_regression.TestChatRegression.test_private_reject_reapply_kick_and_delete_permissions) ... ok
+test_recall_text_and_file_permissions_and_history (test_regression.TestChatRegression.test_recall_text_and_file_permissions_and_history) ... ok
+test_preview_save_and_recall_widgets (test_regression.TestGUIRegression.test_preview_save_and_recall_widgets) ... ok
+test_private_creation_requires_connection (test_regression.TestGUIRegression.test_private_creation_requires_connection) ... ok
+test_two_live_guis_chat_file_recall_and_reconnect (test_regression.TestGUIRegression.test_two_live_guis_chat_file_recall_and_reconnect) ... ok
+test_cli_unicode_empty_and_quit (test_regression.TestLegacyEcho.test_cli_unicode_empty_and_quit) ... ok
+test_file_and_payload_limits (test_regression.TestTransportAndSchema.test_file_and_payload_limits) ... ok
+test_schema_unhashable_type_is_protocol_error (test_regression.TestTransportAndSchema.test_schema_unhashable_type_is_protocol_error) ... ok
+test_split_header_and_coalesced_frames_empty_and_eof (test_regression.TestTransportAndSchema.test_split_header_and_coalesced_frames_empty_and_eof) ... ok
+test_truncated_header_and_body (test_regression.TestTransportAndSchema.test_truncated_header_and_body) ... ok
+test_cancelled_oserror_cannot_report_error_for_new_attempt (test_network_lifecycle.TestConnectionGeneration.test_cancelled_oserror_cannot_report_error_for_new_attempt) ... ok
+test_cancelled_refusal_cannot_report_error_for_new_attempt (test_network_lifecycle.TestConnectionGeneration.test_cancelled_refusal_cannot_report_error_for_new_attempt) ... ok
+test_cancelled_success_cannot_replace_new_socket (test_network_lifecycle.TestConnectionGeneration.test_cancelled_success_cannot_replace_new_socket) ... ok
+test_cancelled_timeout_cannot_clear_new_connecting_state (test_network_lifecycle.TestConnectionGeneration.test_cancelled_timeout_cannot_clear_new_connecting_state) ... ok
+
+----------------------------------------------------------------------
+Ran 24 tests in 3.073s
+
+OK

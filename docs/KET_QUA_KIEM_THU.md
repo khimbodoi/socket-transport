@@ -2,6 +2,12 @@
 
 **Trạng thái: bản nháp chờ chủ dự án review; còn các ca chuyên sâu không đạt, chưa chốt nghiệm thu.**
 
+## Cập nhật sau khi sửa D03 — 28/11/2026
+
+Chủ dự án đã tự sửa `network_client.py` bằng mã riêng cho từng lần kết nối. Codex kiểm tra lại: ca tái hiện gốc đạt 3/3; 4 ca hồi quy mới trong `test_network_lifecycle.py` đạt, bao gồm thành công/timeout/từ chối/lỗi socket đến muộn. Bộ tổng hợp **24/24 đạt** trên bản chuẩn bị đưa lên GitHub; xem [log](kiem-thu/d03-full-20261128.txt) và [changelog](../CHANGELOG.md).
+
+Phần worker kết nối D03 đã được xác minh. Chưa xác minh đầy đủ tác vụ file/sự kiện cũ qua đổi phiên; chưa chạy lại toàn bộ bộ chuyên sâu 14 ca. Các kết quả ở các phần dưới ghi lại thời điểm audit trước sửa D03, không được hiểu là lần chạy mới hoặc mọi lỗi khác đã được sửa.
+
 | Thông tin | Nội dung |
 | --- | --- |
 | Ngày chạy kiểm thử tự động | 27/11/2026 và chạy bổ sung ngày 28/11/2026 |
