@@ -1,0 +1,101 @@
+{
+  "date": "2026-11-28",
+  "runtime_commit": "3347aa2e11b07822e8022562755b9005922c1ef3",
+  "runtime_hashes": {
+    "transport.py": "853e6f512d1d387b5a8c3abf282f832c1922877a8ee46a6ee15ca4a64119d66e",
+    "server.py": "ba966ab3d2df8f8ca103ed428d569b6a4c436517783f8888370181f6b0311439",
+    "client.py": "6470912ba03882325912c2226bfef7c7345a528663794fa2cc8119f3e8309694",
+    "protocol.py": "2b3103d75c6366b7f05dd0e23792e79af61a90176d7a2d5e8aad301a4225e819",
+    "storage.py": "ea5a517df7de309af40ab4930d80f622295a1ed7b4edd29ab523a737e3603a7a",
+    "chat_server.py": "afc78f95ebe848b8a34bd99ebb73f4b849df1aa720a90a81e10c2c30d6f43d4e",
+    "network_client.py": "c36c825c796b8e9e04f7c734c4115e11bb8431e29bfef47af74172b926c36e72",
+    "gui_client.py": "a688cf2db0580fc2952ade3176a84d37e2cd4904e01afb1b30f3c34019519820"
+  },
+  "runs": [
+    {
+      "name": "baseline",
+      "exit_code": 0,
+      "summary": [
+        "----------------------------------------------------------------------",
+        "Ran 20 tests in 3.134s",
+        "",
+        "OK"
+      ],
+      "failed_cases": [],
+      "log_sha256": "d79e5d4107d11f4d3a07c27f589bd4ee3263df5a235f8d821f3cd0d78ef4c8bf"
+    },
+    {
+      "name": "deep-run-1",
+      "exit_code": 1,
+      "summary": [
+        "----------------------------------------------------------------------",
+        "Ran 14 tests in 2.289s",
+        "",
+        "FAILED (failures=11)"
+      ],
+      "failed_cases": [
+        "test_D07_sending_chat_does_not_block_the_tk_thread_on_file_lock",
+        "test_D03_cancelled_connect_cannot_replace_new_connection",
+        "test_D01_offline_name_cannot_take_over_private_admin",
+        "test_D02_simultaneous_hello_reserves_unique_names",
+        "test_D04_upload_commit_cannot_race_with_kick",
+        "test_D05_chat_cannot_recreate_deleted_private_room",
+        "test_D06_history_replay_cannot_restore_recalled_text",
+        "test_D08_file_metadata_cannot_poison_future_history",
+        "test_D09_pending_chunks_cannot_exceed_declared_file_size",
+        "test_D10_large_message_id_is_rejected_without_worker_exception",
+        "test_D11_member_list_is_bounded_for_long_usernames"
+      ],
+      "log_sha256": "1506e9fd7e2c7a2619eb1837bbbb1da413a0e59b56a12bf986ba459e6da433cc"
+    },
+    {
+      "name": "deep-run-2",
+      "exit_code": 1,
+      "summary": [
+        "----------------------------------------------------------------------",
+        "Ran 14 tests in 2.243s",
+        "",
+        "FAILED (failures=11)"
+      ],
+      "failed_cases": [
+        "test_D07_sending_chat_does_not_block_the_tk_thread_on_file_lock",
+        "test_D03_cancelled_connect_cannot_replace_new_connection",
+        "test_D01_offline_name_cannot_take_over_private_admin",
+        "test_D02_simultaneous_hello_reserves_unique_names",
+        "test_D04_upload_commit_cannot_race_with_kick",
+        "test_D05_chat_cannot_recreate_deleted_private_room",
+        "test_D06_history_replay_cannot_restore_recalled_text",
+        "test_D08_file_metadata_cannot_poison_future_history",
+        "test_D09_pending_chunks_cannot_exceed_declared_file_size",
+        "test_D10_large_message_id_is_rejected_without_worker_exception",
+        "test_D11_member_list_is_bounded_for_long_usernames"
+      ],
+      "log_sha256": "d47aebfcc15cb3861320c2873b55e0c50562dcaa4d89b4e7c68b1985f6745559"
+    },
+    {
+      "name": "deep-run-3",
+      "exit_code": 1,
+      "summary": [
+        "----------------------------------------------------------------------",
+        "Ran 14 tests in 2.362s",
+        "",
+        "FAILED (failures=11)"
+      ],
+      "failed_cases": [
+        "test_D07_sending_chat_does_not_block_the_tk_thread_on_file_lock",
+        "test_D03_cancelled_connect_cannot_replace_new_connection",
+        "test_D01_offline_name_cannot_take_over_private_admin",
+        "test_D02_simultaneous_hello_reserves_unique_names",
+        "test_D04_upload_commit_cannot_race_with_kick",
+        "test_D05_chat_cannot_recreate_deleted_private_room",
+        "test_D06_history_replay_cannot_restore_recalled_text",
+        "test_D08_file_metadata_cannot_poison_future_history",
+        "test_D09_pending_chunks_cannot_exceed_declared_file_size",
+        "test_D10_large_message_id_is_rejected_without_worker_exception",
+        "test_D11_member_list_is_bounded_for_long_usernames"
+      ],
+      "log_sha256": "9986a303117c3cc27c9c211b3eff8c605ea08dcf0648392b3ccb8e4227988673"
+    }
+  ],
+  "note": "Diagnostic checks express desired behavior; failures remain open. No runtime fixes were applied during this audit."
+}

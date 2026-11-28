@@ -96,6 +96,8 @@ test_client_integration.py  4 bài kiểm thử ban đầu của branch giao di�
 test_regression.py          16 bài kiểm thử bổ sung khi tích hợp
 docs/KIEM_THU.md            Hướng dẫn kiểm thử thủ công từng chức năng
 docs/KET_QUA_KIEM_THU.md    Môi trường, kết quả và giới hạn kiểm thử
+docs/KE_HOACH_FIX.md        Các lỗi đang mở, ưu tiên và tiêu chí nghiệm thu
+docs/KIEM_TRA_GITHUB.md     Trạng thái tích hợp và quy trình làm việc nhóm
 docs/README-echo.md         Tài liệu bản echo trước khi tích hợp GUI
 ```
 
@@ -120,7 +122,9 @@ python -X utf8 -m unittest -v test_client_integration test_regression
 
 Kết quả tại thời điểm tích hợp: **20 bài đạt**, gồm TCP thật, hai GUI, SQLite tạm, file đến 5 MiB và echo cũ. Test tự dùng port rảnh/DB tạm; không cần bật server trước. Cần môi trường có màn hình và Tkinter cho các bài GUI. Không dùng `unittest discover` tùy tiện: `test_oversize.py` là script thao tác mạng khi import, không phải unittest.
 
-Xem [kiểm thử thủ công](docs/KIEM_THU.md) và [báo cáo kết quả](docs/KET_QUA_KIEM_THU.md).
+Kiểm thử bổ sung ngày **28/11/2026**: bộ hiện có vẫn đạt 20/20; bộ chuyên sâu 14 ca có **11 ca không đạt và 3 ca đạt**, cùng kết quả qua ba lần chạy. Các vấn đề đang mở gồm vòng đời kết nối, thao tác phòng đồng thời, thứ tự lịch sử/thu hồi, giới hạn dữ liệu và độ phản hồi GUI. Chưa sửa code ứng dụng trong đợt ghi nhận này.
+
+Xem [kiểm thử thủ công](docs/KIEM_THU.md), [báo cáo kết quả](docs/KET_QUA_KIEM_THU.md), [kế hoạch sửa](docs/KE_HOACH_FIX.md) và [trạng thái GitHub](docs/KIEM_TRA_GITHUB.md). Kết quả bộ cũ không phải bằng chứng mọi tình huống đều đạt.
 
 ## Giới hạn cần biết
 
